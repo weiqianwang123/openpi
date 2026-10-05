@@ -1,6 +1,6 @@
 import json
-import pathlib
 
+from etils import epath
 import numpy as np
 import numpydantic
 import pydantic
@@ -131,16 +131,17 @@ def deserialize_json(data: str) -> dict[str, NormStats]:
     return _NormStatsDict(**json.loads(data)).norm_stats
 
 
-def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> None:
-    """Save the normalization stats to a directory."""
-    path = pathlib.Path(directory) / "norm_stats.json"
+def save(directory: epath.PathLike, norm_stats: dict[str, NormStats]) -> None:
+    """Save the normalization stats to a directory, local or on GCS (a checkpoint's assets, written
+    straight to gs://, where pathlib would turn the URL into a local path and the stats would be lost)."""
+    path = epath.Path(directory) / "norm_stats.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_json(norm_stats))
 
 
-def load(directory: pathlib.Path | str) -> dict[str, NormStats]:
-    """Load the normalization stats from a directory."""
-    path = pathlib.Path(directory) / "norm_stats.json"
+def load(directory: epath.PathLike) -> dict[str, NormStats]:
+    """Load the normalization stats from a directory, local or on GCS."""
+    path = epath.Path(directory) / "norm_stats.json"
     if not path.exists():
         raise FileNotFoundError(f"Norm stats file not found at: {path}")
     return deserialize_json(path.read_text())
