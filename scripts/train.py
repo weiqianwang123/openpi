@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -28,6 +29,9 @@ import openpi.training.streaming_dataset as _streaming_dataset
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+# Set on every host of a multi-host TPU slice (by its launcher).
+MULTIHOST_ENV = "OPENPI_MULTIHOST"
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -49,7 +53,7 @@ def init_logging():
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
+    if not enabled or jax.process_index() != 0:  # one host of a multi-host slice logs
         wandb.init(mode="disabled")
         return
 
@@ -238,10 +242,11 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
+    # Log images from first batch to sanity check (this host's first device's share of it: on a
+    # multi-host slice the batch is not all here).
+    local = [np.asarray(img.addressable_data(0)) for img in batch[0].images.values()]
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([img[i] for img in local], axis=1)) for i in range(min(5, len(local[0])))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -288,5 +293,12 @@ def main(config: _config.TrainConfig):
     checkpoint_manager.wait_until_finished()
 
 
+def _entry() -> None:
+    if os.environ.get(MULTIHOST_ENV):
+        # Every host of a multi-host TPU slice runs this script; JAX joins them into one runtime.
+        jax.distributed.initialize()
+    main(_config.cli())
+
+
 if __name__ == "__main__":
-    _streaming_dataset.run_main(lambda: main(_config.cli()))
+    _streaming_dataset.run_main(_entry)

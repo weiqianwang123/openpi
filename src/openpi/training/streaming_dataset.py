@@ -55,6 +55,7 @@ import time
 import traceback
 
 import datasets
+import jax
 import numpy as np
 import torch
 
@@ -874,6 +875,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             self._ddp_rank = torch.distributed.get_rank()
             self._ddp_world_size = torch.distributed.get_world_size()
+        elif jax.process_count() > 1:
+            # JAX's processes, one a host of a multi-host TPU slice: each streams its own share.
+            self._ddp_rank, self._ddp_world_size = jax.process_index(), jax.process_count()
 
         _streaming_used["value"] = True
 

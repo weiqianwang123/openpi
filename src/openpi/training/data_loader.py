@@ -525,12 +525,12 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
-
         # Iterable datasets (e.g. Hub streaming) have no random access: the DataLoader can't
         # shuffle or sample them, and their length is only a (possibly infinite) estimate.
         is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+        if jax.process_count() > 1 and not is_iterable:
+            # A streamed dataset shards itself across JAX's processes; a map-style one would not.
+            raise NotImplementedError("Data loading with multiple processes is not supported.")
         if is_iterable:
             shuffle = False
             sampler = None
