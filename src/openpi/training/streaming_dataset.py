@@ -415,6 +415,10 @@ class _HubSource:
         # kept file prefix already contains exactly the kept episodes).
         self.max_episodes: int | None = None
         self.kept_episodes: set[int] | None = None
+        # A v3.0 dataset in a schema other than DROID's (set by _init_v30): its frames carry its own columns
+        # (``lowdim_columns`` and the videos) under their own names.
+        self.generic: bool = False
+        self.lowdim_columns: tuple[str, ...] = ()
         self._all_files = retry_call(self._list_files, what=f"listing files for {self.origin}")
 
         info_path = retry_call(
@@ -566,7 +570,16 @@ class _HubSource:
         # Raw v3.0 video column -> common frame-dict image key (only those present in this dataset).
         self.video_key_map: dict[str, str] = {k: v for k, v in _V3_VIDEO_KEY_MAP.items() if k in features}
         if not self.video_key_map:
-            raise ValueError(f"v3.0 dataset {self.repo_id!r} has none of the expected DROID video keys.")
+            # Not DROID's schema (e.g. a bimanual ALOHA-style dataset): every video column and every float
+            # column streams under its own name, images channel-first, as LeRobot's map-style loader yields
+            # them; the data config's repack transform maps them onto the policy's keys.
+            self.generic = True
+            self.video_key_map = {k: k for k, f in features.items() if f.get("dtype") == "video"}
+            self.lowdim_columns = tuple(
+                k for k, f in features.items() if f.get("dtype") in ("float32", "float64") and k != "timestamp"
+            )
+            if not self.video_key_map:
+                raise ValueError(f"v3.0 dataset {self.repo_id!r} has no video columns.")
         self.image_keys: tuple[str, ...] = tuple(self.video_key_map.values())
 
         def _read_meta(rel_paths, columns):
@@ -1006,6 +1019,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         When ``joint_position_actions`` is set, the joint part comes from ``action.joint_position``
         (absolute commanded targets) instead; the delta transform is added by the data config.
         """
+        if source.generic:
+            frame = {
+                "episode_index": int(low["episode_index"][row]),
+                "frame_index": int(low["frame_index"][row]),
+                "task_index": int(low["task_index"][row]),
+                **{column: _as_1d_float(low[column][row]) for column in source.lowdim_columns},
+            }
+            for common_key, decoded in images.items():
+                frame[common_key] = np.transpose(decoded[frame_in_ep], (2, 0, 1))
+            return frame
         action_key = _V3_ACTION_JOINT_POSITION_KEY if self.joint_position_actions else _V3_ACTION_JOINT_VELOCITY_KEY
         frame = {
             "episode_index": int(low["episode_index"][row]),
@@ -1051,6 +1074,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         files = list(files)
         if self.shuffle:
             random.Random(base_seed).shuffle(files)
+        columns = (
+            ["episode_index", "frame_index", "task_index", *source.lowdim_columns]
+            if source.generic
+            else list(self._v3_lowdim_columns)
+        )
         attempt = 0
         while True:
             try:
@@ -1060,12 +1088,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
                     def _read(data_path=data_path):
                         with fs.open(data_path, "rb") as fh:
-                            return pq.ParquetFile(fh).read(columns=list(self._v3_lowdim_columns)).to_pydict()
+                            return pq.ParquetFile(fh).read(columns=columns).to_pydict()
 
                     low = retry_call(_read, what=f"reading {rel}")
                     # pyarrow silently drops absent requested columns (no read-time error), so a missing
                     # action.joint_position would otherwise surface as an opaque KeyError in _make_v3_frame.
-                    if self.joint_position_actions and _V3_ACTION_JOINT_POSITION_KEY not in low:
+                    if self.joint_position_actions and not source.generic and _V3_ACTION_JOINT_POSITION_KEY not in low:
                         raise KeyError(
                             f"{source.repo_id!r} lacks column {_V3_ACTION_JOINT_POSITION_KEY!r} required by "
                             "joint_position_actions=True"

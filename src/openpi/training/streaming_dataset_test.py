@@ -543,3 +543,103 @@ def test_a_rate_limit_is_not_capped_by_the_presigned_budget(monkeypatch):
         return "ok"
 
     assert retry_call(rate_limited, what="reading meta") == "ok"
+
+
+# ---------------------------------------------------------------------------------------------
+# A v3.0 dataset in a schema other than DROID's (a bimanual robot's, say) streams its own columns.
+# ---------------------------------------------------------------------------------------------
+
+
+def _generic_v3(root, frames: int = 4, size: int = 16):
+    """A one-episode v3.0 dataset with one camera and ALOHA-style columns, written by hand."""
+    import av
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    repo = root / "me" / "yam"
+    for d in ("meta/episodes/chunk-000", "data/chunk-000", "videos/observation.images.cam_high/chunk-000"):
+        (repo / d).mkdir(parents=True)
+    video = repo / "videos/observation.images.cam_high/chunk-000/file-000.mp4"
+    with av.open(str(video), "w") as container:
+        stream = container.add_stream("mpeg4", rate=10)
+        stream.width = stream.height = size
+        stream.pix_fmt = "yuv420p"
+        for i in range(frames):
+            image = np.full((size, size, 3), 40 * i, np.uint8)
+            container.mux(stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")))
+        container.mux(stream.encode())
+    state = [[float(i), -float(i)] for i in range(frames)]
+    pq.write_table(
+        pa.table(
+            {
+                "observation.state": state,
+                "action": [[s + 0.5 for s in row] for row in state],
+                "timestamp": np.arange(frames, dtype=np.float32) / 10,
+                "frame_index": np.arange(frames),
+                "episode_index": np.zeros(frames, np.int64),
+                "index": np.arange(frames),
+                "task_index": np.zeros(frames, np.int64),
+            }
+        ),
+        repo / "data/chunk-000/file-000.parquet",
+    )
+    column = "videos/observation.images.cam_high"
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0],
+                "length": [frames],
+                "data/chunk_index": [0],
+                "data/file_index": [0],
+                f"{column}/chunk_index": [0],
+                f"{column}/file_index": [0],
+                f"{column}/from_timestamp": [0.0],
+                f"{column}/to_timestamp": [frames / 10],
+            }
+        ),
+        repo / "meta/episodes/chunk-000/file-000.parquet",
+    )
+    pq.write_table(pa.table({"task_index": [0], "task": ["hold still"]}), repo / "meta/tasks.parquet")
+    feature = {"dtype": "float32", "shape": [2], "names": None}
+    (repo / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "total_frames": frames,
+                "fps": 10,
+                "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+                "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+                "features": {
+                    "observation.images.cam_high": {"dtype": "video", "shape": [size, size, 3], "names": None},
+                    "observation.state": feature,
+                    "action": feature,
+                    "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+                },
+            }
+        )
+    )
+
+
+def test_a_v3_dataset_in_another_schema_streams_its_own_columns(tmp_path):
+    """Not DROID's schema: each video and float column under its own name, images channel-first (as
+    LeRobot's map-style loader yields them), the action chunked by the config's key, the prompt from
+    the task."""
+    _generic_v3(tmp_path)
+    dataset = StreamingLeRobotDataset(
+        ["me/yam"],
+        action_horizon=2,
+        action_sequence_keys=("action",),
+        prompt_from_task=True,
+        shuffle=False,
+        mirror_root=str(tmp_path),
+    )
+    source = dataset.sources[0]
+    assert source.generic
+    assert source.lowdim_columns == ("observation.state", "action")
+    sample = next(iter(dataset))
+    image = sample["observation.images.cam_high"]
+    assert image.shape == (3, 16, 16)
+    assert image.dtype == np.uint8
+    np.testing.assert_allclose(sample["observation.state"], [0.0, -0.0])
+    np.testing.assert_allclose(sample["action"], [[0.5, 0.5], [1.5, -0.5]])
+    assert sample["prompt"] == "hold still"
