@@ -65,7 +65,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     # run instead of opening a second one. On a preemptible TPU that is the difference between one
     # continuous curve and a new chart per preemption.
     id_file = ckpt_dir / "wandb_id.txt"
-    if resuming:
+    if resuming and id_file.exists():  # a run that started without W&B starts its W&B run now
         run_id = id_file.read_text().strip()
         # `allow`, not `must`: the id can outlive the run it named. A first attempt that was
         # preempted before its first log, or that ran with WANDB_MODE=offline, leaves an id W&B has
