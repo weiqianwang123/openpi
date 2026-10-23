@@ -1083,6 +1083,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             if source.generic
             else list(self._v3_lowdim_columns)
         )
+        # A stream begun at an episode's first frame, as every source's would be at once, fills the
+        # shuffle buffer with episodes' openings for its first batches (after each resume, again):
+        # when shuffling, the first episode is entered at a random frame instead.
+        enter_at: random.Random | None = random.Random(base_seed + 1) if self.shuffle else None
         attempt = 0
         while True:
             try:
@@ -1142,7 +1146,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                                 return _decode_video_frames(fs, video_path, from_ts, to_ts, num_frames)
 
                             images[common_key] = retry_call(_decode, what=f"decoding {video_path}")
-                        for i in range(seg_len):
+                        first = enter_at.randrange(seg_len) if enter_at else 0
+                        enter_at = None
+                        for i in range(first, seg_len):
                             yield self._make_v3_frame(source, low, seg_start + i, i, images)
                 if not produced:
                     # Every file was empty (degenerate). Avoid a tight Hub re-read loop; mirrors the v2.1 path.

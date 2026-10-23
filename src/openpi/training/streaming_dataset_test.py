@@ -643,3 +643,24 @@ def test_a_v3_dataset_in_another_schema_streams_its_own_columns(tmp_path):
     np.testing.assert_allclose(sample["observation.state"], [0.0, -0.0])
     np.testing.assert_allclose(sample["action"], [[0.5, 0.5], [1.5, -0.5]])
     assert sample["prompt"] == "hold still"
+
+
+def test_a_shuffled_stream_enters_its_first_episode_at_a_random_frame(tmp_path):
+    """Begun at an episode's first frame, every source's stream would fill the shuffle buffer with
+    episodes' openings: shuffled, the first episode is entered anywhere; in order, at its start."""
+    _generic_v3(tmp_path, frames=12)
+
+    def first_frame(seed, shuffle):
+        dataset = StreamingLeRobotDataset(
+            ["me/yam"],
+            action_horizon=2,
+            action_sequence_keys=("action",),
+            shuffle=shuffle,
+            shuffle_buffer_size=1,
+            seed=seed,
+            mirror_root=str(tmp_path),
+        )
+        return int(next(iter(dataset))["frame_index"])
+
+    assert len({first_frame(seed, shuffle=True) for seed in range(8)}) > 1
+    assert first_frame(0, shuffle=False) == 0
