@@ -233,8 +233,12 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # A streamed dataset keeps no position to resume from: seeded as the run began, a resumed run
+    # would replay the batches it began with (each preemption of a spot TPU, again). Seed it by the
+    # step it resumes at instead.
+    resumed_at = (checkpoint_manager.latest_step() or 0) if resuming else 0
     data_loader = _data_loader.create_data_loader(
-        config,
+        dataclasses.replace(config, seed=config.seed + resumed_at),
         sharding=data_sharding,
         shuffle=True,
     )
