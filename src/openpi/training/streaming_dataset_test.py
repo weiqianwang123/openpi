@@ -664,3 +664,24 @@ def test_a_shuffled_stream_enters_its_first_episode_at_a_random_frame(tmp_path):
 
     assert len({first_frame(seed, shuffle=True) for seed in range(8)}) > 1
     assert first_frame(0, shuffle=False) == 0
+
+
+def test_an_anchor_stride_samples_every_kth_frame_from_a_random_offset(tmp_path):
+    """With a stride of 3 over 12 frames, four samples anchor three frames apart, from an offset the
+    episode draws; the chunk of each still spans the frames after its anchor."""
+    _generic_v3(tmp_path, frames=12)
+    dataset = StreamingLeRobotDataset(
+        ["me/yam"],
+        action_horizon=2,
+        action_sequence_keys=("action",),
+        shuffle=False,
+        anchor_stride=3,
+        mirror_root=str(tmp_path),
+    )
+    samples = [next(it) for it in [iter(dataset)] for _ in range(4)]
+    anchors = [int(s["frame_index"]) for s in samples]
+    assert anchors[0] in (0, 1, 2)
+    assert [b - a for a, b in zip(anchors, anchors[1:])] == [3, 3, 3]
+    np.testing.assert_allclose(samples[0]["action"][1], [anchors[0] + 1.5, -(anchors[0] + 1) + 0.5])
+    with pytest.raises(ValueError, match="anchor_stride"):
+        StreamingLeRobotDataset(["me/yam"], action_horizon=2, anchor_stride=0, mirror_root=str(tmp_path))

@@ -140,6 +140,13 @@ class DataConfig:
     # episodes. Honored by both the map-style (download) and streaming loaders.
     max_episodes: Mapping[str, int] = dataclasses.field(default_factory=dict)
 
+    # Every k-th frame of an episode is a sample's anchor (its action chunk still spans every frame
+    # after it), from a random offset per episode. A streamed episode's frames arrive together, so
+    # with k=1 a shuffle buffer holds a few dozen episodes of a high-rate recording and a batch is drawn
+    # from those; k=6 at 30 Hz spreads the buffer over six times as many episodes at the cost of
+    # nothing: the anchors of neighbouring frames are near-duplicate samples. Only the streaming loader.
+    anchor_stride: int = 1
+
     # Root of a MIRROR of the datasets, e.g. "gs://bucket/user/datasets". When set, the streaming
     # loader reads each repo from <mirror_root>/<repo_id>/ (gcsfs) instead of from the HuggingFace Hub;
     # the layout, the reader and the v3.0 support are identical, only the bytes' origin changes.
@@ -266,6 +273,8 @@ class DataConfigFactory(abc.ABC):
     # Per-repo cap on how many (first-N) episodes to use, keyed by repo_id. Empty => use all episodes of
     # every repo. See DataConfig.max_episodes.
     max_episodes: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    # Every k-th frame of an episode anchors a sample when streaming. See DataConfig.anchor_stride.
+    anchor_stride: int = 1
     # Read the repos from a mirror (e.g. "gs://bucket/user/datasets") instead of the Hub. Defaults to
     # $OPENPI_DATA_MIRROR_ROOT. See DataConfig.mirror_root.
     mirror_root: str | None = dataclasses.field(default_factory=lambda: os.environ.get("OPENPI_DATA_MIRROR_ROOT"))
@@ -300,6 +309,7 @@ class DataConfigFactory(abc.ABC):
             joint_position_actions=self.joint_position_actions,
             sampling_weights=self.sampling_weights,
             max_episodes=self.max_episodes,
+            anchor_stride=self.anchor_stride,
             mirror_root=self.mirror_root,
         )
 

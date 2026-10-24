@@ -811,6 +811,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         joint_position_actions: bool = False,
         sampling_weights: Mapping[str, float] | None = None,
         max_episodes: Mapping[str, int] | None = None,
+        anchor_stride: int = 1,
         mirror_root: str | None = None,
     ):
         super().__init__()
@@ -826,6 +827,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.shuffle_buffer_size = max(1, int(shuffle_buffer_size))
         self.seed = int(seed)
         self.joint_position_actions = bool(joint_position_actions)
+        if int(anchor_stride) < 1:
+            raise ValueError(f"anchor_stride must be positive, got {anchor_stride}.")
+        # Every k-th frame of an episode anchors a sample, from a random offset per episode (see
+        # DataConfig.anchor_stride): the samples of neighbouring frames are near-duplicates, and a
+        # streamed episode's frames arrive together.
+        self.anchor_stride = int(anchor_stride)
         # When set (e.g. "gs://bucket/user/datasets"), read every repo from a mirror under
         # <mirror_root>/<repo_id>/ instead of from the Hub. See _HubSource.
         self.mirror_root: str | None = mirror_root.rstrip("/") if mirror_root else None
@@ -1217,16 +1224,25 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         frame_index = int(np.asarray(anchor["frame_index"]).item())
         return any(start <= frame_index < end for start, end in ranges)
 
-    def _chunk_frames(self, frames: Iterator[dict], source: _HubSource) -> Iterator[dict]:
-        """Turn an ordered frame stream into anchor-chunked samples, respecting episode bounds."""
+    def _chunk_frames(self, frames: Iterator[dict], source: _HubSource, rng: random.Random) -> Iterator[dict]:
+        """Turn an ordered frame stream into anchor-chunked samples, respecting episode bounds.
+
+        ``rng`` draws each episode's anchor offset (see ``anchor_stride``).
+        """
         horizon = self.action_horizon
+        stride = self.anchor_stride
         window: list[dict] = []
         current_ep: int | None = None
+        offset = 0
+
+        def is_anchor(frame: dict) -> bool:
+            frame_index = int(np.asarray(frame["frame_index"]).item())
+            return (frame_index - offset) % stride == 0 and self._keep_anchor(source, frame)
 
         def flush_tail() -> Iterator[dict]:
             # Emit remaining anchors (near the episode end) with padding.
             for i in range(len(window)):
-                if self._keep_anchor(source, window[i]):
+                if is_anchor(window[i]):
                     yield self._make_sample(window[i:], source)
 
         for frame in frames:
@@ -1239,12 +1255,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             if is_boundary:
                 yield from flush_tail()
                 window = []
+            if not window:
+                offset = rng.randrange(stride)
             current_ep = episode
             window.append(frame)
             # Emit any anchor that now has a full horizon of in-episode frames available (subject to
-            # the non-idle filter for this source).
+            # the stride and the non-idle filter for this source).
             while len(window) >= horizon:
-                if self._keep_anchor(source, window[0]):
+                if is_anchor(window[0]):
                     yield self._make_sample(window[:horizon], source)
                 window.pop(0)
         # Infinite streams never reach here, but be correct if a source ever ends.
@@ -1307,7 +1325,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 # per-worker split stays disjoint and complete.
                 file_seed = self.seed + rank * 9973 + source_idx * 104729
                 frames = self._stream_frames(source, rank_files, file_seed)
-            gens.append(self._chunk_frames(frames, source))
+            gens.append(self._chunk_frames(frames, source, random.Random(file_seed + 3)))
             # Explicit per-repo weight if configured, else mix proportional to the number of *sampleable*
             # frames (for a filtered source this is its kept-frame count, so the non-idle filter shrinks
             # its share of the mixture accordingly). Every worker uses the same weights and -- thanks to
