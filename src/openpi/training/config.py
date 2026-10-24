@@ -654,6 +654,15 @@ class TrainConfig:
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
+    # Validation while training: every `val_interval` steps (0: never), the mean loss of the
+    # parameters a checkpoint holds (the EMA's) over `val_batches` batches of `val_repo_ids`, mixed
+    # by `val_sampling_weights` (empty: in proportion to their frames). The batches are streamed anew
+    # each time with a fixed seed, so every validation sees the same ones; logged as `val_loss`.
+    val_repo_ids: Sequence[str] = ()
+    val_sampling_weights: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    val_interval: int = 0
+    val_batches: int = 32
+
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.

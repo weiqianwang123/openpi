@@ -207,6 +207,35 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def val_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Float[at.Array, ""]:
+    """The mean loss of the parameters a checkpoint holds (the EMA's, when kept) on a batch."""
+    params = state.params if state.ema_params is None else state.ema_params
+    model = nnx.merge(state.model_def, params)
+    model.eval()
+    observation, actions = batch
+    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
+
+
+def validation_loader(config: _config.TrainConfig, sharding: jax.sharding.Sharding):
+    """A loader of `config.val_batches` batches of the validation repos, the same batches at every
+    call: streamed in this process (no workers to spawn) with the config's seed, and a small shuffle
+    buffer, so a validation costs a minute, not a worker pool."""
+    data = dataclasses.replace(
+        config.data,
+        repo_id=list(config.val_repo_ids),
+        sampling_weights=dict(config.val_sampling_weights),
+        max_episodes={},
+        streaming_shuffle_buffer_size=min(config.data.streaming_shuffle_buffer_size, 2000),
+    )
+    val_config = dataclasses.replace(config, data=data, num_workers=0)
+    return _data_loader.create_data_loader(val_config, sharding=sharding, shuffle=True, num_batches=config.val_batches)
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -268,6 +297,16 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    if config.val_interval:
+        if not config.val_repo_ids:
+            raise ValueError("val_interval is set but val_repo_ids names no repo to validate on.")
+        pval_step = jax.jit(
+            val_step,
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+        val_rng = jax.random.key(config.seed + 1)
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -292,6 +331,17 @@ def main(config: _config.TrainConfig):
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+
+        if config.val_interval and (
+            (step % config.val_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+        ):
+            losses = [
+                pval_step(jax.random.fold_in(val_rng, i), train_state, val_batch)
+                for i, val_batch in enumerate(validation_loader(config, data_sharding))
+            ]
+            val_loss = float(jnp.mean(jnp.stack(losses)))
+            pbar.write(f"Step {step}: val_loss={val_loss:.4f}")
+            wandb.log({"val_loss": val_loss}, step=step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

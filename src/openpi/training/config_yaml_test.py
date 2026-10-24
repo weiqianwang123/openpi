@@ -238,9 +238,7 @@ def test_extends_with_a_model_override_rederives_freeze_filter():
 
 
 def test_extends_without_a_model_override_keeps_the_base_freeze_filter():
-    child = config_yaml.build_config(
-        {"extends": "pi05droid-lora-d100+toys", "batch_size": 8}, name="lora_child"
-    )
+    child = config_yaml.build_config({"extends": "pi05droid-lora-d100+toys", "batch_size": 8}, name="lora_child")
     base = _config.get_config("pi05droid-lora-d100+toys")
     assert _same_filter(child.freeze_filter, base.freeze_filter)
 
@@ -347,3 +345,18 @@ def test_asking_for_a_broken_config_reports_its_actual_error(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="failed to load.*bogus_field"):
         _config.get_config("typo_cfg")
+
+
+def test_validation_fields_come_through_the_yaml(tmp_path: pathlib.Path):
+    """The validation repos, their weights, the interval and the batch count are TrainConfig's."""
+    (tmp_path / "val.yaml").write_text(
+        "val_repo_ids: [me/a_val, me/b_val]\n"
+        "val_sampling_weights: {me/a_val: 0.5, me/b_val: 0.5}\n"
+        "val_interval: 5000\n"
+        "val_batches: 16\n"
+    )
+    found = {c.name: c for c in config_yaml.load_configs(tmp_path, register=False)}["val"]
+    assert list(found.val_repo_ids) == ["me/a_val", "me/b_val"]
+    assert found.val_sampling_weights == {"me/a_val": 0.5, "me/b_val": 0.5}
+    assert (found.val_interval, found.val_batches) == (5000, 16)
+    assert _config.TrainConfig(name="x").val_interval == 0
