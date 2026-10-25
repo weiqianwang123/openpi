@@ -7,6 +7,7 @@ owning zero episodes and hanging), ``_mixing_weight`` (explicit vs size-proporti
 """
 
 import json
+import random
 import types
 
 import numpy as np
@@ -707,3 +708,23 @@ def test_a_stream_without_images_decodes_no_video(tmp_path):
     assert sample["observation.images.cam_high"].shape == (3, 1, 1)
     assert not sample["observation.images.cam_high"].any()
     np.testing.assert_allclose(sample["action"], [[0.5, 0.5], [1.5, -0.5]])
+
+
+def test_the_shuffle_buffer_yields_before_it_is_full_and_grows_to_its_size():
+    """A sixteenth full, the buffer begins to yield, one item for every two it takes, until it holds
+    its size; every item comes out once."""
+    taken = []
+
+    def stream():
+        for i in range(1000):
+            taken.append(i)
+            yield i
+
+    buffer = types.SimpleNamespace(shuffle=True, shuffle_buffer_size=160)
+    out = StreamingLeRobotDataset._shuffle_buffer(buffer, stream(), random.Random(0))  # noqa: SLF001
+    yielded = [next(out)]
+    assert len(taken) == 10  # 160 // 16
+    yielded += [next(out) for _ in range(100)]
+    assert len(taken) == 210  # two taken for each one yielded while it grows
+    yielded += list(out)
+    assert sorted(yielded) == list(range(1000))

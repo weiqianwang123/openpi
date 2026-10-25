@@ -1281,14 +1281,24 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # -- mixing + shuffling -------------------------------------------------------------------
 
     def _shuffle_buffer(self, it: Iterator[dict], rng: random.Random) -> Iterator[dict]:
+        """Items in random order from a buffer of ``shuffle_buffer_size``. It yields once a sixteenth
+        full, then grows to its size yielding one item for every two it takes: filling it first took
+        most of an hour on a TPU host (each restart, after a preemption, waited that long for a step),
+        while a buffer a sixteenth the size already mixes the stream's episodes."""
         size = self.shuffle_buffer_size
         if not self.shuffle or size <= 1:
             yield from it
             return
+        start = max(1, size // 16)
         buffer: list[dict] = []
-        for item in it:
+        for taken, item in enumerate(it, 1):
             if len(buffer) < size:
                 buffer.append(item)
+                if len(buffer) < start or taken % 2:
+                    continue
+                j = rng.randrange(len(buffer))
+                buffer[j], buffer[-1] = buffer[-1], buffer[j]
+                yield buffer.pop()
                 continue
             j = rng.randrange(size)
             out, buffer[j] = buffer[j], item
