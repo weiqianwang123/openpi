@@ -640,6 +640,10 @@ def test_a_v3_dataset_in_another_schema_streams_its_own_columns(tmp_path):
     image = sample["observation.images.cam_high"]
     assert image.shape == (3, 16, 16)
     assert image.dtype == np.uint8
+    # Its own memory, not a view of the decoded episode (which a buffered sample would keep alive).
+    assert image.base is None
+    assert image.flags.c_contiguous
+    assert sample["observation.state"].base is None
     np.testing.assert_allclose(sample["observation.state"], [0.0, -0.0])
     np.testing.assert_allclose(sample["action"], [[0.5, 0.5], [1.5, -0.5]])
     assert sample["prompt"] == "hold still"

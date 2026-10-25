@@ -346,7 +346,8 @@ _V3_LOWDIM_COLUMNS = (
 
 
 def _as_1d_float(value) -> np.ndarray:
-    return np.atleast_1d(np.asarray(value, dtype=np.float32))
+    # A copy: a view would keep the file's whole column alive while the sample waits in a buffer.
+    return np.array(value, dtype=np.float32, ndmin=1)
 
 
 def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_frames: int) -> np.ndarray:
@@ -1042,7 +1043,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 **{column: _as_1d_float(low[column][row]) for column in source.lowdim_columns},
             }
             for common_key, decoded in images.items():
-                frame[common_key] = np.transpose(decoded[frame_in_ep], (2, 0, 1))
+                # Copied out: a view would keep the whole decoded episode alive for as long as any of
+                # its samples waits in the shuffle buffer (one episode a sample, with an anchor stride).
+                frame[common_key] = np.ascontiguousarray(np.transpose(decoded[frame_in_ep], (2, 0, 1)))
             return frame
         action_key = _V3_ACTION_JOINT_POSITION_KEY if self.joint_position_actions else _V3_ACTION_JOINT_VELOCITY_KEY
         frame = {
@@ -1056,7 +1059,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             "task_index": int(low["task_index"][row]),
         }
         for common_key, decoded in images.items():
-            frame[common_key] = decoded[frame_in_ep]
+            frame[common_key] = decoded[frame_in_ep].copy()  # not a view of the episode (see above)
         return frame
 
     def _stream_frames_v3(
