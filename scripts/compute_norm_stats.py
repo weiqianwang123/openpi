@@ -69,6 +69,7 @@ def create_streaming_dataloader(
     batch_size: int,
     seed: int,
     max_frames: int | None = None,
+    num_workers: int = 0,
 ) -> tuple[_data_loader.Dataset, int]:
     # When subsampling (max_frames set) shuffle so the stats come from a representative sample across
     # all episodes rather than the first in-file-order frames (mirrors the map-style path, which sets
@@ -89,12 +90,14 @@ def create_streaming_dataloader(
         num_batches = max_frames // batch_size
     else:
         num_batches = total_frames // batch_size
-    # num_workers=0 keeps a single deterministic stream so we cover ~one pass over the data.
+    # num_workers=0 keeps a single deterministic stream so we cover ~one pass over the data; a sample
+    # (max_frames) may be drawn by several workers, each streaming its own share (a remote mirror's
+    # latency, not the CPU, bounds one worker).
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
         num_batches=num_batches,
-        num_workers=0,
+        num_workers=num_workers if max_frames is not None else 0,
     )
     return data_loader, num_batches
 
@@ -137,7 +140,7 @@ def main(config_name: str, max_frames: int | None = None):
         )
     elif data_config.streaming:
         data_loader, num_batches = create_streaming_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.seed, max_frames
+            data_config, config.model.action_horizon, config.batch_size, config.seed, max_frames, config.num_workers
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
