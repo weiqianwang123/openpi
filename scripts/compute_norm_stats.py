@@ -16,10 +16,16 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.streaming_dataset as _streaming_dataset
 import openpi.transforms as transforms
 
+# What the statistics are of.
+STATS_KEYS = ("state", "actions")
 
-class RemoveStrings(transforms.DataTransformFn):
+
+class KeepStatsKeys(transforms.DataTransformFn):
+    """Drops all but STATS_KEYS before batching: the prompt (a string) and the images, which
+    datasets mixed together may hold at different sizes, are not normalized."""
+
     def __call__(self, x: dict) -> dict:
-        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+        return {k: v for k, v in x.items() if k in STATS_KEYS}
 
 
 def create_torch_dataloader(
@@ -38,8 +44,7 @@ def create_torch_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
+            KeepStatsKeys(),
         ],
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -76,8 +81,7 @@ def create_streaming_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
+            KeepStatsKeys(),
         ],
         is_batched=False,
     )
@@ -107,8 +111,7 @@ def create_rlds_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
+            KeepStatsKeys(),
         ],
         is_batched=True,
     )
@@ -141,11 +144,10 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    keys = ["state", "actions"]
-    stats = {key: normalize.RunningStats() for key in keys}
+    stats = {key: normalize.RunningStats() for key in STATS_KEYS}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-        for key in keys:
+        for key in STATS_KEYS:
             stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
