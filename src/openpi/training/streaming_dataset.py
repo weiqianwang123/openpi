@@ -813,6 +813,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         max_episodes: Mapping[str, int] | None = None,
         anchor_stride: int = 1,
         mirror_root: str | None = None,
+        decode_images: bool = True,
     ):
         super().__init__()
         if isinstance(repo_ids, str):
@@ -833,6 +834,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # DataConfig.anchor_stride): the samples of neighbouring frames are near-duplicates, and a
         # streamed episode's frames arrive together.
         self.anchor_stride = int(anchor_stride)
+        # Off, a frame's cameras are a black pixel each, nothing decoded (v3.0): what needs only the
+        # low-dim columns (normalization statistics) streams them at the parquet's pace.
+        self.decode_images = bool(decode_images)
         # When set (e.g. "gs://bucket/user/datasets"), read every repo from a mirror under
         # <mirror_root>/<repo_id>/ instead of from the Hub. See _HubSource.
         self.mirror_root: str | None = mirror_root.rstrip("/") if mirror_root else None
@@ -1147,6 +1151,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                         seg_len = int(seg_end - seg_start)
                         images = {}
                         for raw_key, common_key in source.video_key_map.items():
+                            if not self.decode_images:
+                                images[common_key] = np.zeros((seg_len, 1, 1, 3), np.uint8)
+                                continue
                             video_path, from_ts, to_ts, num_frames = source.video_url(raw_key, episode)
 
                             def _decode(video_path=video_path, from_ts=from_ts, to_ts=to_ts, num_frames=num_frames):

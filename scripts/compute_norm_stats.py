@@ -75,7 +75,10 @@ def create_streaming_dataloader(
     # all episodes rather than the first in-file-order frames (mirrors the map-style path, which sets
     # shuffle=True on subsample). For a full pass (max_frames unset) order is irrelevant to the stats.
     shuffle = max_frames is not None
-    dataset = _data_loader.create_streaming_dataset(data_config, action_horizon, shuffle=shuffle, seed=seed)
+    # Only the state and the actions are normalized: no video is decoded.
+    dataset = _data_loader.create_streaming_dataset(
+        data_config, action_horizon, shuffle=shuffle, seed=seed, decode_images=False
+    )
     total_frames = dataset.total_frames
     dataset = _data_loader.IterableTransformedDataset(
         dataset,

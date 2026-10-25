@@ -681,7 +681,25 @@ def test_an_anchor_stride_samples_every_kth_frame_from_a_random_offset(tmp_path)
     samples = [next(it) for it in [iter(dataset)] for _ in range(4)]
     anchors = [int(s["frame_index"]) for s in samples]
     assert anchors[0] in (0, 1, 2)
-    assert [b - a for a, b in zip(anchors, anchors[1:])] == [3, 3, 3]
+    assert np.diff(anchors).tolist() == [3, 3, 3]
     np.testing.assert_allclose(samples[0]["action"][1], [anchors[0] + 1.5, -(anchors[0] + 1) + 0.5])
     with pytest.raises(ValueError, match="anchor_stride"):
         StreamingLeRobotDataset(["me/yam"], action_horizon=2, anchor_stride=0, mirror_root=str(tmp_path))
+
+
+def test_a_stream_without_images_decodes_no_video(tmp_path):
+    """For what needs only the low-dim columns, each camera is a black pixel a frame, the rest as
+    decoded."""
+    _generic_v3(tmp_path)
+    dataset = StreamingLeRobotDataset(
+        ["me/yam"],
+        action_horizon=2,
+        action_sequence_keys=("action",),
+        shuffle=False,
+        mirror_root=str(tmp_path),
+        decode_images=False,
+    )
+    sample = next(iter(dataset))
+    assert sample["observation.images.cam_high"].shape == (3, 1, 1)
+    assert not sample["observation.images.cam_high"].any()
+    np.testing.assert_allclose(sample["action"], [[0.5, 0.5], [1.5, -0.5]])

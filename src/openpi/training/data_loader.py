@@ -178,9 +178,10 @@ def create_torch_dataset(
 
 
 def create_streaming_dataset(
-    data_config: _config.DataConfig, action_horizon: int, *, shuffle: bool, seed: int
+    data_config: _config.DataConfig, action_horizon: int, *, shuffle: bool, seed: int, decode_images: bool = True
 ) -> IterableDataset:
-    """Create an iterable dataset that streams the LeRobot repo(s) from the Hub (no local storage)."""
+    """Create an iterable dataset that streams the LeRobot repo(s) from the Hub (no local storage); without
+    ``decode_images``, a black pixel stands in for each camera's frame (see StreamingLeRobotDataset)."""
     repo_ids = _config.repo_id_as_list(data_config.repo_id)
     if not repo_ids:
         raise ValueError("Repo ID is not set. Cannot create streaming dataset.")
@@ -198,6 +199,7 @@ def create_streaming_dataset(
         max_episodes=data_config.max_episodes,
         anchor_stride=data_config.anchor_stride,
         mirror_root=data_config.mirror_root,
+        decode_images=decode_images,
     )
 
 
