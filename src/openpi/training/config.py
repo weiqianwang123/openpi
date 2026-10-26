@@ -657,7 +657,8 @@ class TrainConfig:
     # Validation while training: every `val_interval` steps (0: never), the mean loss of the
     # parameters a checkpoint holds (the EMA's) over `val_batches` batches of `val_repo_ids`, mixed
     # by `val_sampling_weights` (empty: in proportion to their frames). The batches are streamed anew
-    # each time with a fixed seed, so every validation sees the same ones; logged as `val_loss`.
+    # each time with a fixed seed, so every validation sees the same ones; logged as `val_loss`, and with
+    # repos of several owners, each owner's alone as `val_loss/<owner>` (scripts/train.py's validation_sets).
     val_repo_ids: Sequence[str] = ()
     val_sampling_weights: Mapping[str, float] = dataclasses.field(default_factory=dict)
     val_interval: int = 0

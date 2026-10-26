@@ -28,3 +28,20 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
     # test resuming
     config = dataclasses.replace(config, resume=True, num_train_steps=4)
     train.main(config)
+
+
+def test_validation_is_also_scored_by_owner():
+    """With repos of two owners, `val_loss` mixes them all and each owner's repos are scored alone
+    (on half the batches), their weights kept; with one owner, only `val_loss`."""
+    config = _config.TrainConfig(
+        name="val",
+        val_repo_ids=["sim_val/a", "sim_val/b", "real_val/c"],
+        val_sampling_weights={"sim_val/a": 0.1, "sim_val/b": 0.4, "real_val/c": 0.5},
+        val_batches=32,
+    )
+    sets = train.validation_sets(config)
+    assert list(sets) == ["val_loss", "val_loss/sim_val", "val_loss/real_val"]
+    assert sets["val_loss"][2] == 32
+    assert sets["val_loss/sim_val"] == (["sim_val/a", "sim_val/b"], {"sim_val/a": 0.1, "sim_val/b": 0.4}, 16)
+    single = dataclasses.replace(config, val_repo_ids=["sim_val/a"], val_sampling_weights={})
+    assert list(train.validation_sets(single)) == ["val_loss"]

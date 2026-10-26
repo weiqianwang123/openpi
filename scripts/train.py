@@ -221,19 +221,43 @@ def val_step(
     return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
 
 
-def validation_loader(config: _config.TrainConfig, sharding: jax.sharding.Sharding):
-    """A loader of `config.val_batches` batches of the validation repos, the same batches at every
-    call: streamed in this process (no workers to spawn) with the config's seed, and a small shuffle
-    buffer, so a validation costs a minute, not a worker pool."""
+def validation_sets(config: _config.TrainConfig) -> dict[str, tuple[list[str], dict[str, float], int]]:
+    """What a validation scores, by the name it is logged as: `val_loss`, every validation repo mixed by
+    `val_sampling_weights` over `val_batches`; and when the repos come from several owners (the part of
+    a repo id before its `/`: a simulator's and a robot's datasets, say), `val_loss/<owner>`, each
+    owner's repos alone over half as many batches, to tell which one a change in `val_loss` comes from.
+    Each: its repos, their weights and its batches."""
+    weights = dict(config.val_sampling_weights)
+    sets = {"val_loss": (list(config.val_repo_ids), weights, config.val_batches)}
+    owners: dict[str, list[str]] = {}
+    for repo in config.val_repo_ids:
+        owners.setdefault(repo.split("/", 1)[0], []).append(repo)
+    if len(owners) > 1:
+        for owner, repos in owners.items():
+            own = {repo: weights[repo] for repo in repos if repo in weights}
+            sets[f"val_loss/{owner}"] = (repos, own, max(1, config.val_batches // 2))
+    return sets
+
+
+def validation_loader(
+    config: _config.TrainConfig,
+    sharding: jax.sharding.Sharding,
+    repo_ids: list[str],
+    weights: dict[str, float],
+    batches: int,
+):
+    """A loader of `batches` batches of `repo_ids` mixed by `weights`, the same batches at every call:
+    streamed in this process (no workers to spawn) with the config's seed, and a small shuffle buffer,
+    so a validation costs minutes, not a worker pool."""
     data = dataclasses.replace(
         config.data,
-        repo_id=list(config.val_repo_ids),
-        sampling_weights=dict(config.val_sampling_weights),
+        repo_id=repo_ids,
+        sampling_weights=weights,
         max_episodes={},
         streaming_shuffle_buffer_size=min(config.data.streaming_shuffle_buffer_size, 2000),
     )
     val_config = dataclasses.replace(config, data=data, num_workers=0)
-    return _data_loader.create_data_loader(val_config, sharding=sharding, shuffle=True, num_batches=config.val_batches)
+    return _data_loader.create_data_loader(val_config, sharding=sharding, shuffle=True, num_batches=batches)
 
 
 def main(config: _config.TrainConfig):
@@ -335,13 +359,16 @@ def main(config: _config.TrainConfig):
         if config.val_interval and (
             (step % config.val_interval == 0 and step > start_step) or step == config.num_train_steps - 1
         ):
-            losses = [
-                pval_step(jax.random.fold_in(val_rng, i), train_state, val_batch)
-                for i, val_batch in enumerate(validation_loader(config, data_sharding))
-            ]
-            val_loss = float(jnp.mean(jnp.stack(losses)))
-            pbar.write(f"Step {step}: val_loss={val_loss:.4f}")
-            wandb.log({"val_loss": val_loss}, step=step)
+            scores = {}
+            for name, (repos, weights, batches) in validation_sets(config).items():
+                loader = validation_loader(config, data_sharding, repos, weights, batches)
+                losses = [
+                    pval_step(jax.random.fold_in(val_rng, i), train_state, val_batch)
+                    for i, val_batch in enumerate(loader)
+                ]
+                scores[name] = float(jnp.mean(jnp.stack(losses)))
+            pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in scores.items()))
+            wandb.log(scores, step=step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
