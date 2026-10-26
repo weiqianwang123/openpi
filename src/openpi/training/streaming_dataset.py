@@ -345,13 +345,72 @@ _V3_LOWDIM_COLUMNS = (
 )
 
 
+def _columns(table) -> dict:
+    """A parquet table's columns as numpy arrays, a list column's as an array of rows (``to_pydict``
+    made Python objects of every value: most of a file's reading time). A list column whose rows differ
+    in length stays a list of lists."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    out = {}
+    for name in table.column_names:
+        column = table.column(name).combine_chunks()
+        if (
+            pa.types.is_list(column.type)
+            or pa.types.is_large_list(column.type)
+            or pa.types.is_fixed_size_list(column.type)
+        ):
+            lengths = pc.list_value_length(column).to_numpy(zero_copy_only=False)
+            if len(column) and (lengths == lengths[0]).all():
+                out[name] = column.flatten().to_numpy(zero_copy_only=False).reshape(len(column), int(lengths[0]))
+            else:
+                out[name] = column.to_pylist()
+        else:
+            out[name] = column.to_numpy(zero_copy_only=False)
+    return out
+
+
 def _as_1d_float(value) -> np.ndarray:
     # A copy: a view would keep the file's whole column alive while the sample waits in a buffer.
     return np.array(value, dtype=np.float32, ndmin=1)
 
 
-def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_frames: int) -> np.ndarray:
-    """Decode ``num_frames`` RGB frames starting at ``from_ts`` from a streamed MP4 (returns [N,H,W,3] uint8).
+_REFORMATTERS: dict = {}  # this process's PyAV reformatters, by frame size and format (see _rgb)
+
+
+def _rgb(frame) -> np.ndarray:
+    """A decoded PyAV frame as an RGB array (HWC uint8), through one reformatter a process for each frame
+    size and format: a frame's own ``to_ndarray`` sets up a converter anew each call (about 1 ms a frame,
+    against 0.03 ms), as would one reformatter alternating between datasets' sizes."""
+    key = (frame.width, frame.height, frame.format.name)
+    if key not in _REFORMATTERS:
+        from av.video.reformatter import VideoReformatter
+
+        _REFORMATTERS[key] = VideoReformatter()
+    return _REFORMATTERS[key].reformat(frame, format="rgb24").to_ndarray()
+
+
+class _Image:
+    """A frame's image, made an RGB array (uint8; channel-first if ``channels_first``) only when a sample is
+    anchored on it (``rgb``): with an anchor stride most frames are never a sample's. ``frame`` is a decoded
+    PyAV frame, or an array (HWC)."""
+
+    __slots__ = ("channels_first", "frame")
+
+    def __init__(self, frame, *, channels_first: bool):
+        self.frame = frame
+        self.channels_first = channels_first
+
+    def rgb(self) -> np.ndarray:
+        """The image: an array of its own (not a view of the episode's, which a sample waiting in the
+        shuffle buffer would keep alive)."""
+        image = self.frame if isinstance(self.frame, np.ndarray) else _rgb(self.frame)
+        return np.array(np.transpose(image, (2, 0, 1)) if self.channels_first else image, order="C")
+
+
+def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_frames: int) -> list:
+    """Decode ``num_frames`` frames starting at ``from_ts`` from a streamed MP4 (returns PyAV's frames, in
+    their own format: :class:`_Image` converts the ones a sample uses).
 
     Streams the MP4 over a seekable ``hf://`` handle: PyAV seeks to ``from_ts`` and reads only the needed
     byte ranges, so the (large) video file is never downloaded in full. Defensively pads/truncates to
@@ -360,7 +419,7 @@ def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_
     import av  # Imported lazily so v2.1-only usage does not require PyAV.
 
     handle = fs.open(video_path, "rb")
-    frames: list[np.ndarray] = []
+    frames: list = []
     try:
         container = av.open(handle)
         stream = container.streams.video[0]
@@ -371,7 +430,7 @@ def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_
                 continue
             if len(frames) >= num_frames:
                 break
-            frames.append(frame.to_ndarray(format="rgb24"))
+            frames.append(frame)
         container.close()
     finally:
         handle.close()
@@ -379,7 +438,7 @@ def _decode_video_frames(fs, video_path: str, from_ts: float, to_ts: float, num_
         raise ValueError(f"Decoded 0 frames from {video_path} in [{from_ts:.3f}, {to_ts:.3f}].")
     while len(frames) < num_frames:
         frames.append(frames[-1])
-    return np.stack(frames[:num_frames])
+    return frames[:num_frames]
 
 
 class _HubSource:
@@ -1043,9 +1102,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 **{column: _as_1d_float(low[column][row]) for column in source.lowdim_columns},
             }
             for common_key, decoded in images.items():
-                # Copied out: a view would keep the whole decoded episode alive for as long as any of
-                # its samples waits in the shuffle buffer (one episode a sample, with an anchor stride).
-                frame[common_key] = np.ascontiguousarray(np.transpose(decoded[frame_in_ep], (2, 0, 1)))
+                frame[common_key] = _Image(decoded[frame_in_ep], channels_first=True)
             return frame
         action_key = _V3_ACTION_JOINT_POSITION_KEY if self.joint_position_actions else _V3_ACTION_JOINT_VELOCITY_KEY
         frame = {
@@ -1059,7 +1116,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             "task_index": int(low["task_index"][row]),
         }
         for common_key, decoded in images.items():
-            frame[common_key] = decoded[frame_in_ep].copy()  # not a view of the episode (see above)
+            frame[common_key] = _Image(decoded[frame_in_ep], channels_first=False)
         return frame
 
     def _stream_frames_v3(
@@ -1110,7 +1167,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
                     def _read(data_path=data_path):
                         with fs.open(data_path, "rb") as fh:
-                            return pq.ParquetFile(fh).read(columns=columns).to_pydict()
+                            return _columns(pq.ParquetFile(fh).read(columns=columns))
 
                     low = retry_call(_read, what=f"reading {rel}")
                     # pyarrow silently drops absent requested columns (no read-time error), so a missing
@@ -1192,10 +1249,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         horizon = self.action_horizon
         sample = dict(anchor)
 
-        # Decode image features to numpy HWC uint8 (matches np.asarray(PIL) used downstream).
-        for key in source.image_keys:
-            if key in sample:
-                sample[key] = np.asarray(sample[key])
+        # The anchor's images as arrays (uint8; HWC, or CHW for a dataset of another schema).
+        for key, value in sample.items():
+            if isinstance(value, _Image):
+                sample[key] = value.rgb()
 
         # Chunk each action-sequence key over the (episode-clamped) horizon window.
         for key in self.action_sequence_keys:
