@@ -104,6 +104,7 @@ def main(args: Args) -> None:
             ),
             flush=True,
         )
+        del model, score  # its parameters off the device before the next checkpoint's
 
 
 if __name__ == "__main__":
