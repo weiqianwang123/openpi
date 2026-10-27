@@ -43,10 +43,15 @@ class Args:
 
 
 def _data(config: _config.TrainConfig, args: Args, repos: list[str]) -> _config.TrainConfig:
-    """``config`` reading ``repos``, its statistics the first checkpoint's, one process, fixed seed."""
+    """``config`` reading ``repos``, its statistics the first checkpoint's, one process, fixed seed;
+    mixed by the config's validation weights where it has one for each repo, else by their frames, and
+    every episode of each (the training repos' caps and weights are not theirs)."""
+    weights = config.val_sampling_weights
     data = dataclasses.replace(
         config.data,
         repo_id=repos,
+        sampling_weights={repo: weights[repo] for repo in repos} if all(r in weights for r in repos) else {},
+        max_episodes={},
         assets=dataclasses.replace(config.data.assets, assets_dir=str(args.checkpoints[0] / "assets")),
         streaming_shuffle_buffer_size=args.shuffle_buffer,
     )
