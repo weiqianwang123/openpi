@@ -31,8 +31,8 @@ def test_train(tmp_path: pathlib.Path, config_name: str):
 
 
 def test_validation_is_also_scored_by_owner():
-    """With repos of two owners, `val_loss` mixes them all and each owner's repos are scored alone
-    (on half the batches), their weights kept; with one owner, only `val_loss`."""
+    """With repos of two owners, the scores without a suffix mix them all and each owner's repos are
+    scored alone (on half the batches, `/<owner>`), their weights kept; with one owner, only the mix."""
     config = _config.TrainConfig(
         name="val",
         val_repo_ids=["sim_val/a", "sim_val/b", "real_val/c"],
@@ -40,8 +40,8 @@ def test_validation_is_also_scored_by_owner():
         val_batches=32,
     )
     sets = train.validation_sets(config)
-    assert list(sets) == ["val_loss", "val_loss/sim_val", "val_loss/real_val"]
-    assert sets["val_loss"][2] == 32
-    assert sets["val_loss/sim_val"] == (["sim_val/a", "sim_val/b"], {"sim_val/a": 0.1, "sim_val/b": 0.4}, 16)
+    assert list(sets) == ["", "/sim_val", "/real_val"]
+    assert sets[""][2] == 32
+    assert sets["/sim_val"] == (["sim_val/a", "sim_val/b"], {"sim_val/a": 0.1, "sim_val/b": 0.4}, 16)
     single = dataclasses.replace(config, val_repo_ids=["sim_val/a"], val_sampling_weights={})
-    assert list(train.validation_sets(single)) == ["val_loss"]
+    assert list(train.validation_sets(single)) == [""]

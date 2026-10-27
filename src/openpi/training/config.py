@@ -659,10 +659,13 @@ class TrainConfig:
     # by `val_sampling_weights` (empty: in proportion to their frames). The batches are streamed anew
     # each time with a fixed seed, so every validation sees the same ones; logged as `val_loss`, and with
     # repos of several owners, each owner's alone as `val_loss/<owner>` (scripts/train.py's validation_sets).
+    # Each also gets `val_action_error`: the actions sampled in full against the data's, over the first
+    # `val_action_dims` dims (the robot's; None: all, padding included; training_utils.validation_scores).
     val_repo_ids: Sequence[str] = ()
     val_sampling_weights: Mapping[str, float] = dataclasses.field(default_factory=dict)
     val_interval: int = 0
     val_batches: int = 32
+    val_action_dims: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False

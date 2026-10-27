@@ -4,6 +4,7 @@ from typing import Any
 from flax import nnx
 from flax import struct
 import jax
+import jax.numpy as jnp
 import optax
 
 from openpi.models import model as _model
@@ -21,6 +22,23 @@ class TrainState:
 
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
+
+
+def validation_scores(
+    model: _model.BaseModel,
+    rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    actions: _model.Actions,
+    action_dims: int | None = None,
+) -> tuple[at.Array, at.Array]:
+    """A batch's scores for `model` (in eval mode): its mean loss, and its action error: the mean squared
+    error of the actions it samples in full (its sampler's flow steps from noise, as served) against the
+    batch's, in the normalized space it is trained in, over the first `action_dims` dims (the robot's;
+    None: all, padding included). The loss draws its noise from `rng`, the sampler from its fold with 1."""
+    model.eval()
+    loss = jnp.mean(model.compute_loss(rng, observation, actions, train=False))
+    sampled = model.sample_actions(jax.random.fold_in(rng, 1), observation)
+    return loss, jnp.mean(jnp.square(sampled - actions)[..., :action_dims])
 
 
 @at.typecheck

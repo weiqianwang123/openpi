@@ -212,31 +212,45 @@ def val_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> at.Float[at.Array, ""]:
-    """The mean loss of the parameters a checkpoint holds (the EMA's, when kept) on a batch."""
+    action_dims: int | None = None,
+) -> tuple[at.Float[at.Array, ""], at.Float[at.Array, ""]]:
+    """The scores of the parameters a checkpoint holds (the EMA's, when kept) on a batch: the mean loss
+    and the action error over the first `action_dims` dims (training_utils.validation_scores)."""
     params = state.params if state.ema_params is None else state.ema_params
-    model = nnx.merge(state.model_def, params)
-    model.eval()
     observation, actions = batch
-    return jnp.mean(model.compute_loss(rng, observation, actions, train=False))
+    return training_utils.validation_scores(nnx.merge(state.model_def, params), rng, observation, actions, action_dims)
 
 
 def validation_sets(config: _config.TrainConfig) -> dict[str, tuple[list[str], dict[str, float], int]]:
-    """What a validation scores, by the name it is logged as: `val_loss`, every validation repo mixed by
-    `val_sampling_weights` over `val_batches`; and when the repos come from several owners (the part of
-    a repo id before its `/`: a simulator's and a robot's datasets, say), `val_loss/<owner>`, each
-    owner's repos alone over half as many batches, to tell which one a change in `val_loss` comes from.
-    Each: its repos, their weights and its batches."""
+    """What a validation scores, by the suffix its scores are logged with (`val_loss<suffix>`,
+    `val_action_error<suffix>`): every validation repo mixed by `val_sampling_weights` over
+    `val_batches` (no suffix); and when the repos come from several owners (the part of a repo id before
+    its `/`: a simulator's and a robot's datasets, say), each owner's repos alone over half as many
+    batches (`/<owner>`), to tell which one a change comes from. Each: its repos, their weights and its
+    batches."""
     weights = dict(config.val_sampling_weights)
-    sets = {"val_loss": (list(config.val_repo_ids), weights, config.val_batches)}
+    sets = {"": (list(config.val_repo_ids), weights, config.val_batches)}
     owners: dict[str, list[str]] = {}
     for repo in config.val_repo_ids:
         owners.setdefault(repo.split("/", 1)[0], []).append(repo)
     if len(owners) > 1:
         for owner, repos in owners.items():
             own = {repo: weights[repo] for repo in repos if repo in weights}
-            sets[f"val_loss/{owner}"] = (repos, own, max(1, config.val_batches // 2))
+            sets[f"/{owner}"] = (repos, own, max(1, config.val_batches // 2))
     return sets
+
+
+def validate(config: _config.TrainConfig, pval_step, val_rng, train_state, data_sharding) -> dict[str, float]:
+    """Every validation set's scores (`validation_sets`) for `train_state`, by the names they are logged
+    as, batch i's noise drawn from `val_rng` folded with i."""
+    scores = {}
+    for suffix, (repos, weights, batches) in validation_sets(config).items():
+        loader = validation_loader(config, data_sharding, repos, weights, batches)
+        found = [pval_step(jax.random.fold_in(val_rng, i), train_state, batch) for i, batch in enumerate(loader)]
+        losses, errors = zip(*found, strict=True)
+        scores[f"val_loss{suffix}"] = float(jnp.mean(jnp.stack(losses)))
+        scores[f"val_action_error{suffix}"] = float(jnp.mean(jnp.stack(errors)))
+    return scores
 
 
 def validation_loader(
@@ -325,9 +339,9 @@ def main(config: _config.TrainConfig):
         if not config.val_repo_ids:
             raise ValueError("val_interval is set but val_repo_ids names no repo to validate on.")
         pval_step = jax.jit(
-            val_step,
+            functools.partial(val_step, action_dims=config.val_action_dims),
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-            out_shardings=replicated_sharding,
+            out_shardings=(replicated_sharding, replicated_sharding),
         )
         val_rng = jax.random.key(config.seed + 1)
 
@@ -359,16 +373,13 @@ def main(config: _config.TrainConfig):
         if config.val_interval and (
             (step % config.val_interval == 0 and step > start_step) or step == config.num_train_steps - 1
         ):
-            scores = {}
-            for name, (repos, weights, batches) in validation_sets(config).items():
-                loader = validation_loader(config, data_sharding, repos, weights, batches)
-                losses = [
-                    pval_step(jax.random.fold_in(val_rng, i), train_state, val_batch)
-                    for i, val_batch in enumerate(loader)
-                ]
-                scores[name] = float(jnp.mean(jnp.stack(losses)))
-            pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in scores.items()))
-            wandb.log(scores, step=step)
+            try:
+                scores = validate(config, pval_step, val_rng, train_state, data_sharding)
+            except Exception:  # a report: if it fails, the training goes on
+                logging.exception("Step %d: the validation failed", step)
+            else:
+                pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in scores.items()))
+                wandb.log(scores, step=step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
