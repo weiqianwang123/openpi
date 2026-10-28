@@ -728,3 +728,183 @@ def test_the_shuffle_buffer_yields_before_it_is_full_and_grows_to_its_size():
     assert len(taken) == 210  # two taken for each one yielded while it grows
     yielded += list(out)
     assert sorted(yielded) == list(range(1000))
+
+
+# ---------------------------------------------------------------------------------------------
+# A training stream (start_sample) reads in passes and goes on where it was when its run resumes.
+# ---------------------------------------------------------------------------------------------
+
+
+def _v3_files(root, lengths_by_file):
+    """A v3.0 dataset ``me/many`` of several data files, each holding episodes of the given lengths in
+    turn, written by hand (low-dim columns only: its streams decode no video)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    repo = root / "me" / "many"
+    for d in ("meta/episodes/chunk-000", "data/chunk-000"):
+        (repo / d).mkdir(parents=True)
+    column = "videos/observation.images.cam_high"
+    meta = {key: [] for key in ("episode_index", "length", "data/chunk_index", "data/file_index")}
+    meta |= {f"{column}/{key}": [] for key in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")}
+    episode = 0
+    for file_index, lengths in enumerate(lengths_by_file):
+        episodes = np.concatenate([np.full(n, episode + i) for i, n in enumerate(lengths)])
+        frames = np.concatenate([np.arange(n) for n in lengths])
+        state = np.stack([episodes, frames], axis=1).astype(np.float32)
+        pq.write_table(
+            pa.table(
+                {
+                    "observation.state": state.tolist(),
+                    "action": state.tolist(),
+                    "timestamp": frames.astype(np.float32) / 10,
+                    "frame_index": frames,
+                    "episode_index": episodes,
+                    "index": np.arange(len(frames)),
+                    "task_index": np.zeros(len(frames), np.int64),
+                }
+            ),
+            repo / f"data/chunk-000/file-{file_index:03d}.parquet",
+        )
+        for n in lengths:
+            for key, value in zip(meta, (episode, n, 0, file_index, 0, 0, 0.0, n / 10), strict=True):
+                meta[key].append(value)
+            episode += 1
+    pq.write_table(pa.table(meta), repo / "meta/episodes/chunk-000/file-000.parquet")
+    pq.write_table(pa.table({"task_index": [0], "task": ["sort"]}), repo / "meta/tasks.parquet")
+    feature = {"dtype": "float32", "shape": [2], "names": None}
+    (repo / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "total_frames": sum(map(sum, lengths_by_file)),
+                "fps": 10,
+                "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+                "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+                "features": {
+                    "observation.images.cam_high": {"dtype": "video", "shape": [8, 8, 3], "names": None},
+                    "observation.state": feature,
+                    "action": feature,
+                },
+            }
+        )
+    )
+
+
+_LENGTHS = [[7, 5, 9], [4, 8], [6, 6, 3, 5]]  # three files, nine episodes, 53 frames
+_EPISODES = [n for lengths in _LENGTHS for n in lengths]  # their lengths, by index
+
+
+def _training_stream(root, start_sample, **kwargs):
+    """The (episode, frame) of each sample of the training stream of ``me/many`` begun at ``start_sample``."""
+    dataset = StreamingLeRobotDataset(
+        ["me/many"],
+        action_horizon=2,
+        action_sequence_keys=("action",),
+        shuffle_buffer_size=1,
+        mirror_root=str(root),
+        decode_images=False,
+        start_sample=start_sample,
+        **kwargs,
+    )
+    for sample in dataset:
+        yield int(sample["episode_index"]), int(sample["frame_index"])
+
+
+def _take(stream, n):
+    return [next(stream) for _ in range(n)]
+
+
+def test_a_training_stream_reads_every_episode_once_a_pass_each_pass_in_its_own_order(tmp_path):
+    """Every frame anchors a sample once a pass (53 here), each file's episodes read while the file is,
+    the passes' orders differing. Begun afresh, the stream enters its first episode at a frame of its
+    own, so the first pass is what is left of it."""
+    _v3_files(tmp_path, _LENGTHS)
+    samples = _take(_training_stream(tmp_path, 0), 3 * 53)
+    entered = samples[0][1]
+    every = sorted((e, f) for e, n in enumerate(_EPISODES) for f in range(n))
+    passes = [samples[53 - entered + 53 * p :][:53] for p in range(2)]
+    files = {
+        e: i
+        for i, lengths in enumerate(_LENGTHS)
+        for e in range(sum(map(len, _LENGTHS[:i])), sum(map(len, _LENGTHS[: i + 1])))
+    }
+    for read in passes:
+        assert sorted(read) == every
+        episodes = [e for i, (e, _) in enumerate(read) if i == 0 or read[i - 1][0] != e]
+        assert len(episodes) == 9  # each episode once, whole
+        visited = [files[e] for e in episodes]
+        assert visited == sorted(visited, key=visited.index)  # a file's episodes together
+    assert passes[0] != passes[1]
+
+
+def test_a_resumed_training_stream_goes_on_where_the_run_was(tmp_path):
+    """Made anew at the samples drawn so far, as a resumed run makes it, the stream yields what the
+    stream never interrupted would have: restarts, however many and wherever, change nothing."""
+    _v3_files(tmp_path, _LENGTHS)
+    whole = _take(_training_stream(tmp_path, 0), 200)
+    pieces, drawn = [], 0
+    for size in (1, 17, 40, 2, 53, 33, 54):
+        pieces += _take(_training_stream(tmp_path, drawn), size)
+        drawn += size
+    assert pieces == whole
+
+
+def test_a_training_stream_is_its_seed_s(tmp_path):
+    """The same seed reads the same passes; another seed, other orders."""
+    _v3_files(tmp_path, _LENGTHS)
+    assert _take(_training_stream(tmp_path, 0, seed=3), 120) == _take(_training_stream(tmp_path, 0, seed=3), 120)
+    assert _take(_training_stream(tmp_path, 0, seed=3), 120) != _take(_training_stream(tmp_path, 0, seed=4), 120)
+
+
+def test_a_transient_error_reads_the_episode_again_from_where_it_stopped(tmp_path, monkeypatch):
+    """No sample is lost or read twice when a read fails midway and is retried."""
+    _v3_files(tmp_path, _LENGTHS)
+    whole = _take(_training_stream(tmp_path, 0), 120)
+    make = StreamingLeRobotDataset._make_v3_frame  # noqa: SLF001
+    failed = []
+
+    def flaky(self, source, low, row, frame_in_ep, images):
+        if frame_in_ep == 3 and len(failed) < 2:
+            failed.append(row)
+            raise ConnectionError("reset by peer")
+        return make(self, source, low, row, frame_in_ep, images)
+
+    monkeypatch.setattr(StreamingLeRobotDataset, "_make_v3_frame", flaky)
+    monkeypatch.setattr(streaming_dataset.time, "sleep", lambda _: None)
+    assert _take(_training_stream(tmp_path, 0), 120) == whole
+    assert len(failed) == 2
+
+
+def test_a_stream_not_for_training_reads_as_it_did(tmp_path):
+    """Without start_sample (validation, statistics), each file's episodes in order from its first."""
+    _v3_files(tmp_path, _LENGTHS)
+    read = _take(_training_stream(tmp_path, None, shuffle=False), 53)
+    assert read == [(e, f) for e, n in enumerate(_EPISODES) for f in range(n)]
+
+
+def test_a_training_stream_s_shards_hold_as_many_episodes_whatever_their_files():
+    """Each shard holds every num_shards-th episode, of every file, all of them once between the shards;
+    with fewer episodes than shards, one each."""
+    by_file = {"a": [(0, 50), (1, 50), (2, 50), (3, 50), (4, 50)], "b": [(5, 50), (6, 50)], "c": [(7, 5)]}
+    owned = streaming_dataset._owned_episodes  # noqa: SLF001
+    for num_shards in (1, 2, 3, 8):
+        held = [[e for _, mine in owned(by_file, shard, num_shards) for e, _ in mine] for shard in range(num_shards)]
+        assert sorted(e for mine in held for e in mine) == list(range(8))
+        assert max(map(len, held)) - min(map(len, held)) <= 1
+    assert owned(by_file, 2, 3) == [("a", [(2, 50)]), ("b", [(5, 50)])]
+    assert [owned(by_file, shard, 11) for shard in (8, 9)] == [[("a", [(0, 50)])], [("a", [(1, 50)])]]
+
+
+def test_a_position_is_the_pass_episode_and_share_of_it_drawn():
+    samples = {0: 4.0, 1: 2.0, 2: 6.0}
+
+    def order(p):
+        return [("f", e, 0) for e in ((0, 1, 2) if p % 2 == 0 else (2, 0, 1))]
+
+    position = streaming_dataset._position  # noqa: SLF001
+    assert position(samples, order, 0) == (0, 0, 0.0)
+    assert position(samples, order, 5) == (0, 1, 0.5)
+    assert position(samples, order, 12) == (1, 0, 0.0)
+    assert position(samples, order, 12 + 7) == (1, 1, 0.25)
+    assert position({0: 0.0}, order, 9) == (0, 0, 0.0)

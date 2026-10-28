@@ -28,6 +28,10 @@ Key properties:
   Training never crashes on a rate limit -- it waits.
 * **Shuffling.** A reservoir-style shuffle buffer approximates a global shuffle over the
   otherwise-ordered stream.
+* **Resuming.** A training stream (``start_sample``) deals each repo's episodes out evenly between the
+  shards and reads a shard's in passes, each in an order of its own fixed by the seed, beginning where it
+  was once the samples drawn before were: a resumed run goes on through its data rather than over the
+  episodes it began with.
 * **Sharding.** DDP ranks are sharded here (``datasets`` is not told the rank in this setup);
   sharding across dataloader workers is delegated to ``datasets``, which splits the file list across
   workers as ``files[worker_id::num_workers]``. Because ``datasets`` does this itself, we must NOT
@@ -764,6 +768,20 @@ class _HubSource:
             int(self.episode_length[episode]),
         )
 
+    def episodes_by_file(self) -> dict[str, list[tuple[int, int]]]:
+        """Each data file's kept episodes (v3.0), in index order, as ``(episode index, frames)``: the
+        episodes ``_stream_frames_v3`` finds in it, known from the metadata without reading it."""
+        found: dict[str, list[tuple[int, int]]] = {rel: [] for rel in self.files}
+        for episode, length, chunk, file in zip(
+            self._episode_index_sorted, self.episode_length, self._ep_data_chunk, self._ep_data_file, strict=True
+        ):
+            if self.kept_episodes is not None and int(episode) not in self.kept_episodes:
+                continue
+            found[self.data_path.format(chunk_index=int(chunk), file_index=int(file))].append(
+                (int(episode), int(length))
+            )
+        return found
+
 
 def _v3_shard_plan(num_files: int, shard_id: int, num_shards: int) -> tuple[list[int], int, int]:
     """Plan how one v3.0 shard reads a repo's canonical data files: ``(file_indices, group, num_groups)``.
@@ -815,6 +833,62 @@ def _episode_owner(num_episodes: int, episode_group: int, num_episode_groups: in
     """
     divisor = min(num_episode_groups, num_episodes) if num_episodes > 0 else 1
     return divisor, episode_group % divisor
+
+
+Owned = list[tuple[str, list[tuple[int, int]]]]  # a shard's (data file, [(episode, frames)]) of a source
+
+
+def _owned_episodes(episodes_by_file: Mapping[str, Sequence[tuple[int, int]]], shard_id: int, num_shards: int) -> Owned:
+    """A training stream's episodes of a source, by data file: every ``num_shards``-th of all its episodes
+    (by index) from the ``shard_id``-th, each shard reading every file for its own -- so each shard holds
+    as many episodes as any other, and a shard drawing as many samples as the others reads its episodes as
+    often. (By whole files, a shard holding a repo's last, small file read its few episodes tens of times
+    as often as the rest: 2026-10-28.) With fewer episodes than shards, each shard reads one."""
+    episodes = sorted((episode, frames, rel) for rel, mine in episodes_by_file.items() for episode, frames in mine)
+    if not episodes:
+        return []
+    mine = episodes[shard_id::num_shards] if len(episodes) >= num_shards else [episodes[shard_id % len(episodes)]]
+    owned: dict[str, list[tuple[int, int]]] = {}
+    for episode, frames, rel in mine:
+        owned.setdefault(rel, []).append((episode, frames))
+    return list(owned.items())
+
+
+def _pass_order(owned: Owned, rng: np.random.Generator) -> list[tuple[str, int, int]]:
+    """One pass over a shard's ``owned`` episodes, ``(file, episode, frames)`` each once: the files in a
+    random order, and each file's episodes in a random order, read while the file is."""
+    order = []
+    for f in rng.permutation(len(owned)):
+        rel, episodes = owned[f]
+        order += [(rel, *episodes[e]) for e in rng.permutation(len(episodes))]
+    return order
+
+
+def _position(
+    samples: Mapping[int, float], order: Callable[[int], list[tuple[str, int, int]]], drawn: float
+) -> tuple[int, int, float]:
+    """Where a stream of passes (``order(p)``, the ``p``-th) over episodes that each yield ``samples[e]``
+    samples on average is once ``drawn`` samples came from it: ``(pass, episode's place in it, fraction of
+    that episode read)``."""
+    total = sum(samples.values())
+    if total <= 0:
+        return 0, 0, 0.0
+    passes, rest = divmod(drawn, total)
+    for k, (_, episode, _) in enumerate(order(int(passes))):
+        if rest < samples[episode]:
+            return int(passes), k, rest / samples[episode]
+        rest -= samples[episode]
+    return int(passes) + 1, 0, 0.0  # at the pass's very end (rounding)
+
+
+def _episode_rows(episode_col: np.ndarray) -> dict[int, tuple[int, int]]:
+    """Each episode's rows ``[begin, end)`` in a data file, by its episode column."""
+    if episode_col.size == 0:
+        return {}
+    boundaries = np.nonzero(np.diff(episode_col))[0] + 1
+    begins = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(episode_col)]])
+    return {int(episode_col[b]): (int(b), int(e)) for b, e in zip(begins, ends, strict=True)}
 
 
 def _mixing_weight(source: _HubSource, sampling_weights: Mapping[str, float] | None) -> float:
@@ -874,6 +948,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         anchor_stride: int = 1,
         mirror_root: str | None = None,
         decode_images: bool = True,
+        start_sample: int | None = None,
     ):
         super().__init__()
         if isinstance(repo_ids, str):
@@ -897,6 +972,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Off, a frame's cameras are a black pixel each, nothing decoded (v3.0): what needs only the
         # low-dim columns (normalization statistics) streams them at the parquet's pace.
         self.decode_images = bool(decode_images)
+        # A training stream (set: the samples this process's loader drew before, 0 for a run begun afresh):
+        # each v3.0 source's episodes are dealt out evenly between the shards (_owned_episodes), a shard's
+        # read in passes, each once a pass in an order fixed by ``seed``, and a stream begins where it was
+        # once that many samples were drawn -- so a resumed run (a preempted spot TPU's) goes on through its
+        # data instead of beginning its episodes anew (each resume, the same ones: 2026-10-28, most of a
+        # run's data was never read). Unset (validation, statistics), each stream begins at its files'
+        # first episodes: the same samples each time.
+        self.start_sample = None if start_sample is None else int(start_sample)
         # When set (e.g. "gs://bucket/user/datasets"), read every repo from a mirror under
         # <mirror_root>/<repo_id>/ instead of from the Hub. See _HubSource.
         self.mirror_root: str | None = mirror_root.rstrip("/") if mirror_root else None
@@ -1119,6 +1202,47 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             frame[common_key] = _Image(decoded[frame_in_ep], channels_first=False)
         return frame
 
+    def _v3_lowdim(self, source: _HubSource, fs, rel: str) -> dict:
+        """The low-dim columns of one of a v3.0 source's data files."""
+        import pyarrow.parquet as pq
+
+        columns = (
+            ["episode_index", "frame_index", "task_index", *source.lowdim_columns]
+            if source.generic
+            else list(self._v3_lowdim_columns)
+        )
+        data_path = source.fs_path(rel)
+
+        def _read():
+            with fs.open(data_path, "rb") as fh:
+                return _columns(pq.ParquetFile(fh).read(columns=columns))
+
+        low = retry_call(_read, what=f"reading {rel}")
+        # pyarrow silently drops absent requested columns (no read-time error), so a missing
+        # action.joint_position would otherwise surface as an opaque KeyError in _make_v3_frame.
+        if self.joint_position_actions and not source.generic and _V3_ACTION_JOINT_POSITION_KEY not in low:
+            raise KeyError(
+                f"{source.repo_id!r} lacks column {_V3_ACTION_JOINT_POSITION_KEY!r} required by "
+                "joint_position_actions=True"
+            )
+        return low
+
+    def _v3_images(self, source: _HubSource, fs, episode: int, frames: int) -> dict:
+        """Each camera's decoded frames of one episode of a v3.0 source (a black pixel each without
+        ``decode_images``)."""
+        images = {}
+        for raw_key, common_key in source.video_key_map.items():
+            if not self.decode_images:
+                images[common_key] = np.zeros((frames, 1, 1, 3), np.uint8)
+                continue
+            video_path, from_ts, to_ts, num_frames = source.video_url(raw_key, episode)
+
+            def _decode(video_path=video_path, from_ts=from_ts, to_ts=to_ts, num_frames=num_frames):
+                return _decode_video_frames(fs, video_path, from_ts, to_ts, num_frames)
+
+            images[common_key] = retry_call(_decode, what=f"decoding {video_path}")
+        return images
+
     def _stream_frames_v3(
         self,
         source: _HubSource,
@@ -1143,17 +1267,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         degenerate empty file), we sleep before retrying rather than busy-looping on the Hub.
         ``num_episode_groups == 1`` (the default whole-file shard) emits every episode, unchanged.
         """
-        import pyarrow.parquet as pq
-
         fs = source.new_fs()
         files = list(files)
         if self.shuffle:
             random.Random(base_seed).shuffle(files)
-        columns = (
-            ["episode_index", "frame_index", "task_index", *source.lowdim_columns]
-            if source.generic
-            else list(self._v3_lowdim_columns)
-        )
         # A stream begun at an episode's first frame, as every source's would be at once, fills the
         # shuffle buffer with episodes' openings for its first batches (after each resume, again):
         # when shuffling, the first episode is entered at a random frame instead.
@@ -1163,20 +1280,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             try:
                 produced = False
                 for rel in files:
-                    data_path = source.fs_path(rel)
-
-                    def _read(data_path=data_path):
-                        with fs.open(data_path, "rb") as fh:
-                            return _columns(pq.ParquetFile(fh).read(columns=columns))
-
-                    low = retry_call(_read, what=f"reading {rel}")
-                    # pyarrow silently drops absent requested columns (no read-time error), so a missing
-                    # action.joint_position would otherwise surface as an opaque KeyError in _make_v3_frame.
-                    if self.joint_position_actions and not source.generic and _V3_ACTION_JOINT_POSITION_KEY not in low:
-                        raise KeyError(
-                            f"{source.repo_id!r} lacks column {_V3_ACTION_JOINT_POSITION_KEY!r} required by "
-                            "joint_position_actions=True"
-                        )
+                    low = self._v3_lowdim(source, fs, rel)
                     attempt = 0
                     episode_col = np.asarray(low["episode_index"])
                     if episode_col.size == 0:
@@ -1209,17 +1313,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                         produced = True
                         episode = int(episode_col[seg_start])
                         seg_len = int(seg_end - seg_start)
-                        images = {}
-                        for raw_key, common_key in source.video_key_map.items():
-                            if not self.decode_images:
-                                images[common_key] = np.zeros((seg_len, 1, 1, 3), np.uint8)
-                                continue
-                            video_path, from_ts, to_ts, num_frames = source.video_url(raw_key, episode)
-
-                            def _decode(video_path=video_path, from_ts=from_ts, to_ts=to_ts, num_frames=num_frames):
-                                return _decode_video_frames(fs, video_path, from_ts, to_ts, num_frames)
-
-                            images[common_key] = retry_call(_decode, what=f"decoding {video_path}")
+                        images = self._v3_images(source, fs, episode, seg_len)
                         first = enter_at.randrange(seg_len) if enter_at else 0
                         enter_at = None
                         for i in range(first, seg_len):
@@ -1240,6 +1334,74 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     exc,
                 )
                 time.sleep(wait)
+
+    def _episode_samples(self, source: _HubSource, episode: int, frames: int) -> float:
+        """The samples an episode yields on average: the frames that may anchor one (its keep-ranges',
+        if the source has them) over the anchor stride."""
+        ranges = source.keep_ranges.get(episode) if source.keep_ranges is not None else None
+        if ranges is not None:
+            frames = sum(max(0, min(end, frames) - start) for start, end in ranges)
+        return frames / self.anchor_stride
+
+    def _stream_positioned_v3(
+        self, source: _HubSource, owned: Owned, seed: Sequence[int], drawn: float
+    ) -> Iterator[dict]:
+        """Yield raw frames of a v3.0 source forever: pass after pass over the shard's ``owned`` episodes,
+        each once a pass, in the order ``_pass_order`` draws for the pass from ``seed`` and its number (the
+        same order whenever the stream is made), from where the stream is once ``drawn`` samples came from
+        it (``_position``, by the episodes' average samples) -- so a stream made anew by a resumed run goes on
+        where the run's was. The first episode is entered at the frame that position falls on. A transient
+        error is waited out and the episode it cut short read again from the frame it stopped at."""
+        fs = source.new_fs()
+        samples = {
+            episode: self._episode_samples(source, episode, frames) for _, mine in owned for episode, frames in mine
+        }
+
+        def order(p: int) -> list[tuple[str, int, int]]:
+            return _pass_order(owned, np.random.default_rng([*seed, p]))
+
+        # Not at an episode's first frame, where every stream begun afresh would be at once, filling the
+        # shuffle buffer with episodes' openings: each stream is a fixed share of its first episode further.
+        _, first_episode, _ = order(0)[0]
+        drawn += np.random.default_rng([*seed]).random() * samples[first_episode]
+        p, k, done = _position(samples, order, drawn)
+        episodes = order(p)
+        first = int(done * episodes[k][2])
+        table: tuple[str, dict, dict[int, tuple[int, int]]] | None = None  # the file read, its episodes' rows
+        attempt = 0
+        while True:
+            if k == len(episodes):
+                p, k, episodes = p + 1, 0, order(p + 1)
+            rel, episode, _ = episodes[k]
+            try:
+                if table is None or table[0] != rel:
+                    low = self._v3_lowdim(source, fs, rel)
+                    table = (rel, low, _episode_rows(np.asarray(low["episode_index"])))
+                _, low, rows = table
+                begin, end = rows[episode]
+                images = self._v3_images(source, fs, episode, end - begin)
+                for i in range(first, end - begin):
+                    yield self._make_v3_frame(source, low, begin + i, i, images)
+                    first = i + 1
+            except Exception as exc:
+                if not _is_retryable(exc):
+                    raise
+                attempt += 1
+                wait = _retry_wait_seconds(exc, attempt)
+                logger.warning(
+                    "Transient Hub error while streaming (v3) %s (attempt %d); sleeping %.1fs then reading "
+                    "episode %d again from frame %d: %r",
+                    source.repo_id,
+                    attempt,
+                    wait,
+                    episode,
+                    first,
+                    exc,
+                )
+                time.sleep(wait)
+                table = None
+                continue
+            attempt, k, first = 0, k + 1, 0
 
     # -- chunking -----------------------------------------------------------------------------
 
@@ -1376,22 +1538,26 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         shard_id = rank * num_workers + worker_id
         num_shards = world_size * num_workers
 
-        gens: list[Iterator[dict]] = []
-        weights: list[float] = []
+        # (source, its index, seed of its files' order, its files here, episode group of groups, episodes owned)
+        plans: list[tuple[_HubSource, int, int, list[str], int, int, Owned]] = []
         for source_idx, source in enumerate(self.sources):
             if source.is_v30:
                 # v3.0 (video): we read parquet + decode video ourselves, so we shard the canonical
                 # data files directly across (rank, worker). When a repo has fewer files than shards,
                 # sharing shards split that file's episodes instead of leaving extra shards empty (which
                 # would pin a small single-file repo to one worker and make its samples arrive in bursts).
+                # A training stream's shard holds episodes of every file instead (_owned_episodes).
                 file_idxs, ep_group, ep_groups = _v3_shard_plan(len(source.files), shard_id, num_shards)
                 if not file_idxs:
                     continue
                 shard_files = [source.files[i] for i in file_idxs]
+                owned: Owned = []
+                if self.start_sample is not None:
+                    owned = _owned_episodes(source.episodes_by_file(), shard_id, num_shards)
+                    if not owned:
+                        continue
                 file_seed = self.seed + shard_id * 9973 + source_idx * 104729
-                frames = self._stream_frames_v3(
-                    source, shard_files, file_seed, episode_group=ep_group, num_episode_groups=ep_groups
-                )
+                plans.append((source, source_idx, file_seed, shard_files, ep_group, ep_groups, owned))
             else:
                 # v2.1 (inline image): shard by DDP rank; worker sharding is delegated to datasets, which
                 # gives this worker rank_files[worker_id::num_workers] (empty when worker_id >= len).
@@ -1401,21 +1567,40 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 # Worker-INDEPENDENT seed so all workers of a rank shuffle identically and datasets'
                 # per-worker split stays disjoint and complete.
                 file_seed = self.seed + rank * 9973 + source_idx * 104729
-                frames = self._stream_frames(source, rank_files, file_seed)
-            gens.append(self._chunk_frames(frames, source, random.Random(file_seed + 3)))
-            # Explicit per-repo weight if configured, else mix proportional to the number of *sampleable*
-            # frames (for a filtered source this is its kept-frame count, so the non-idle filter shrinks
-            # its share of the mixture accordingly). Every worker uses the same weights and -- thanks to
-            # _v3_shard_plan placing every repo on every worker -- yields the same global mix, no bursts.
-            weights.append(_mixing_weight(source, self.sampling_weights))
+                plans.append((source, source_idx, file_seed, rank_files, 0, 1, []))
 
-        if not gens:
+        if not plans:
             # This worker was assigned no files from any source (num_workers exceeds every repo's
             # file/shard count). Return so the DataLoader marks it finished instead of hanging; the
             # remaining workers still cover all of the data.
             return
 
-        rng = random.Random(self.seed + (rank * num_workers + worker_id) * 9973)
+        # Explicit per-repo weight if configured, else mix proportional to the number of *sampleable*
+        # frames (for a filtered source this is its kept-frame count, so the non-idle filter shrinks
+        # its share of the mixture accordingly). Every worker uses the same weights and -- thanks to
+        # _v3_shard_plan placing every repo on every worker -- yields the same global mix, no bursts.
+        weights = [_mixing_weight(source, self.sampling_weights) for source, *_ in plans]
+        # A training stream: this worker drew its share of the process's samples before (the loader takes
+        # a batch from each worker in turn), each source its weight's share of those. Its draws (anchor
+        # offsets, mixing, shuffling) differ from those of the run it resumes.
+        drawn = (self.start_sample or 0) / num_workers
+        resumed = self.start_sample or 0
+        gens: list[Iterator[dict]] = []
+        for (source, source_idx, file_seed, files, ep_group, ep_groups, owned), weight in zip(
+            plans, weights, strict=True
+        ):
+            if not source.is_v30:
+                frames = self._stream_frames(source, files, file_seed)
+            elif self.start_sample is None:
+                frames = self._stream_frames_v3(
+                    source, files, file_seed, episode_group=ep_group, num_episode_groups=ep_groups
+                )
+            else:
+                share = drawn * weight / sum(weights)
+                frames = self._stream_positioned_v3(source, owned, (self.seed, shard_id, source_idx), share)
+            gens.append(self._chunk_frames(frames, source, random.Random(file_seed + 3 + resumed)))
+
+        rng = random.Random(self.seed + resumed + (rank * num_workers + worker_id) * 9973)
 
         def interleaved() -> Iterator[dict]:
             # Proportional ("sample as one dataset") mixing: pick a source with probability

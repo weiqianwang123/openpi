@@ -178,10 +178,17 @@ def create_torch_dataset(
 
 
 def create_streaming_dataset(
-    data_config: _config.DataConfig, action_horizon: int, *, shuffle: bool, seed: int, decode_images: bool = True
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    *,
+    shuffle: bool,
+    seed: int,
+    decode_images: bool = True,
+    start_sample: int | None = None,
 ) -> IterableDataset:
     """Create an iterable dataset that streams the LeRobot repo(s) from the Hub (no local storage); without
-    ``decode_images``, a black pixel stands in for each camera's frame (see StreamingLeRobotDataset)."""
+    ``decode_images``, a black pixel stands in for each camera's frame; with ``start_sample``, a training
+    stream, from where it was once that many samples were drawn (see StreamingLeRobotDataset)."""
     repo_ids = _config.repo_id_as_list(data_config.repo_id)
     if not repo_ids:
         raise ValueError("Repo ID is not set. Cannot create streaming dataset.")
@@ -200,6 +207,7 @@ def create_streaming_dataset(
         anchor_stride=data_config.anchor_stride,
         mirror_root=data_config.mirror_root,
         decode_images=decode_images,
+        start_sample=start_sample,
     )
 
 
@@ -280,6 +288,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    start_step: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -290,6 +299,9 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        start_step: For training, the step the run begins at (0 afresh): a streamed dataset goes on from
+            where it was then; a map-style one, which keeps no position, is drawn anew, seeded by the step.
+            Unset (validation, statistics), the data is drawn the same way each time.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
@@ -317,6 +329,7 @@ def create_data_loader(
             seed=config.seed,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
+            start_step=start_step,
         )
     return create_torch_data_loader(
         data_config,
@@ -327,7 +340,7 @@ def create_data_loader(
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
-        seed=config.seed,
+        seed=config.seed + (start_step or 0),
         skip_norm_stats=skip_norm_stats,
         framework=framework,
     )
@@ -414,6 +427,7 @@ def create_streaming_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    start_step: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader that streams the LeRobot repo(s) from the Hub during training.
 
@@ -431,16 +445,19 @@ def create_streaming_data_loader(
         num_batches: If provided, the number of batches to return; otherwise iterate indefinitely.
         num_workers: Number of dataloader worker processes. Each worker streams a disjoint shard.
         seed: Seed for shuffling / mixing.
+        start_step: For training, the step the run begins at (see create_data_loader).
     """
-    dataset = create_streaming_dataset(data_config, action_horizon, shuffle=shuffle, seed=seed)
-    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=False)
-
     if framework == "pytorch":
         local_batch_size = (
             batch_size // torch.distributed.get_world_size() if torch.distributed.is_initialized() else batch_size
         )
     else:
         local_batch_size = batch_size // jax.process_count()
+    start_sample = None if start_step is None else start_step * local_batch_size
+    dataset = create_streaming_dataset(
+        data_config, action_horizon, shuffle=shuffle, seed=seed, start_sample=start_sample
+    )
+    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=False)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -450,7 +467,7 @@ def create_streaming_data_loader(
         shuffle=False,  # Streaming datasets shuffle internally via their shuffle buffer.
         num_batches=num_batches,
         num_workers=num_workers,
-        seed=seed,
+        seed=seed + (start_step or 0),  # the workers' global generators: other than the resumed run's
         framework=framework,
     )
     return DataLoaderImpl(data_config, data_loader)
