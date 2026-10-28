@@ -469,6 +469,8 @@ def create_streaming_data_loader(
         num_workers=num_workers,
         seed=seed + (start_step or 0),  # the workers' global generators: other than the resumed run's
         framework=framework,
+        # A training batch from every worker (batch_pieces); the others (validation) as they were drawn.
+        pieces=batch_pieces(local_batch_size, num_workers) if start_step is not None else 1,
     )
     return DataLoaderImpl(data_config, data_loader)
 
@@ -529,6 +531,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        pieces: int = 1,
     ):
         """Create a PyTorch data loader.
 
@@ -544,7 +547,13 @@ class TorchDataLoader:
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
+            pieces: The pieces a batch is taken in, ``local_batch_size // pieces`` each: torch's loader
+                takes each from the next worker in turn, so a batch draws on that many workers' streams
+                (each worker's prefetch kept at two batches' worth).
         """
+        if local_batch_size % pieces:
+            raise ValueError(f"A batch of {local_batch_size} is not {pieces} equal pieces.")
+        self._pieces = pieces
         # Iterable datasets (e.g. Hub streaming) have no random access: the DataLoader can't
         # shuffle or sample them, and their length is only a (possibly infinite) estimate.
         is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
@@ -575,7 +584,7 @@ class TorchDataLoader:
         generator.manual_seed(seed)
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
+            batch_size=local_batch_size // pieces,
             shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
             sampler=sampler,
             num_workers=num_workers,
@@ -585,6 +594,7 @@ class TorchDataLoader:
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
+            prefetch_factor=2 * pieces if num_workers > 0 else None,
         )
 
     @property
@@ -599,7 +609,7 @@ class TorchDataLoader:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return
                 try:
-                    batch = next(data_iter)
+                    batch = self._next_batch(data_iter)
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
@@ -608,6 +618,26 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+
+    def _next_batch(self, data_iter):
+        """The next batch: torch's next, or its next ``pieces`` joined."""
+        if self._pieces == 1:
+            return next(data_iter)
+        pieces = [next(data_iter) for _ in range(self._pieces)]
+        return jax.tree.map(lambda *xs: np.concatenate(xs, axis=0), *pieces)
+
+
+def batch_pieces(local_batch_size: int, num_workers: int) -> int:
+    """The pieces a training batch is taken in from a streamed dataset's workers (TorchDataLoader's
+    ``pieces``): the most pieces of equal size up to a worker's share of the batch, so that every
+    worker gives at least one. Whole, a batch was one worker's: drawn on one shuffle buffer, about 120
+    episodes a batch of 256 at 12 workers (2026-10-28), where each worker giving a piece draws on all
+    the buffers, about 235 -- nearly as many as a batch drawn from the whole dataset."""
+    if num_workers <= 1:
+        return 1
+    share = max(1, local_batch_size // num_workers)
+    piece = max(size for size in range(1, share + 1) if local_batch_size % size == 0)
+    return local_batch_size // piece
 
 
 def _collate_fn(items):

@@ -2,7 +2,9 @@ import dataclasses
 import pathlib
 
 import jax
+import numpy as np
 import pytest
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -116,3 +118,36 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+class _WorkerCounts(torch.utils.data.IterableDataset):
+    """Each worker's stream: its id and its count, forever."""
+
+    def __iter__(self):
+        worker = torch.utils.data.get_worker_info().id
+        for i in range(10**9):
+            yield {"worker": np.int64(worker), "i": np.int64(i)}
+
+
+def test_a_batch_in_pieces_draws_on_every_worker_each_stream_in_order():
+    """Three workers, a batch of 12 in three pieces: four from each worker, and each worker's stream
+    goes on in order from one batch to the next."""
+    loader = _data_loader.TorchDataLoader(
+        _WorkerCounts(), local_batch_size=12, num_batches=3, num_workers=3, framework="pytorch", pieces=3
+    )
+    seen = {0: [], 1: [], 2: []}
+    for batch in loader:
+        workers, counts = batch["worker"].numpy(), batch["i"].numpy()
+        assert sorted(np.bincount(workers).tolist()) == [4, 4, 4]
+        for worker in seen:
+            seen[worker] += counts[workers == worker].tolist()
+    assert all(counts == list(range(12)) for counts in seen.values())
+    with pytest.raises(ValueError, match="equal pieces"):
+        _data_loader.TorchDataLoader(_WorkerCounts(), local_batch_size=10, num_workers=3, pieces=3)
+
+
+def test_a_training_batch_is_taken_in_a_piece_from_every_worker():
+    assert _data_loader.batch_pieces(256, 12) == 16  # sixteen of 16: every worker one or two
+    assert _data_loader.batch_pieces(128, 8) == 8  # eight of 16: one each
+    assert _data_loader.batch_pieces(32, 0) == 1
+    assert _data_loader.batch_pieces(8, 16) == 8  # more workers than samples: one sample a piece
