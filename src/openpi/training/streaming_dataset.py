@@ -30,8 +30,9 @@ Key properties:
   otherwise-ordered stream.
 * **Resuming.** A training stream (``start_sample``) deals each repo's episodes out evenly between the
   shards and reads a shard's in passes, each in an order of its own fixed by the seed, beginning where it
-  was once the samples drawn before were: a resumed run goes on through its data rather than over the
-  episodes it began with.
+  was once the samples drawn before were, and fills its shuffle buffer before its first sample: a
+  resumed run goes on through its data rather than over the episodes it began with, its batches as
+  varied as before.
 * **Sharding.** DDP ranks are sharded here (``datasets`` is not told the rank in this setup);
   sharding across dataloader workers is delegated to ``datasets``, which splits the file list across
   workers as ``files[worker_id::num_workers]``. Because ``datasets`` does this itself, we must NOT
@@ -975,10 +976,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # A training stream (set: the samples this process's loader drew before, 0 for a run begun afresh):
         # each v3.0 source's episodes are dealt out evenly between the shards (_owned_episodes), a shard's
         # read in passes, each once a pass in an order fixed by ``seed``, and a stream begins where it was
-        # once that many samples were drawn -- so a resumed run (a preempted spot TPU's) goes on through its
-        # data instead of beginning its episodes anew (each resume, the same ones: 2026-10-28, most of a
-        # run's data was never read). Unset (validation, statistics), each stream begins at its files'
-        # first episodes: the same samples each time.
+        # once that many samples were drawn, its shuffle buffer full before it yields -- so a resumed run
+        # (a preempted spot TPU's) goes on through its data instead of beginning its episodes anew (each
+        # resume, the same ones: 2026-10-28, most of a run's data was never read). Unset (validation,
+        # statistics), each stream begins at its files' first episodes: the same samples each time.
         self.start_sample = None if start_sample is None else int(start_sample)
         # When set (e.g. "gs://bucket/user/datasets"), read every repo from a mirror under
         # <mirror_root>/<repo_id>/ instead of from the Hub. See _HubSource.
@@ -1500,20 +1501,22 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # -- mixing + shuffling -------------------------------------------------------------------
 
     def _shuffle_buffer(self, it: Iterator[dict], rng: random.Random) -> Iterator[dict]:
-        """Items in random order from a buffer of ``shuffle_buffer_size``. It yields once a sixteenth
-        full, then grows to its size yielding one item for every two it takes: filling it first took
-        most of an hour on a TPU host (each restart, after a preemption, waited that long for a step),
-        while a buffer a sixteenth the size already mixes the stream's episodes."""
+        """Items in random order from a buffer of ``shuffle_buffer_size``. A training stream's yields
+        once the buffer is full: a sixteenth full, a resumed run's batches drew on a quarter of the
+        episodes they drew on once it was, most of them their previous batch's, for its first thousand
+        steps (half a spot TPU's run, 2026-10-28), while the stream, begun where the run's was
+        (``start_sample``), reads to where it read to once full. Any other stream yields once a sixteenth
+        full, then grows to its size yielding one item for every two it takes, its first sample sooner."""
         size = self.shuffle_buffer_size
         if not self.shuffle or size <= 1:
             yield from it
             return
-        start = max(1, size // 16)
+        start = size if self.start_sample is not None else max(1, size // 16)
         buffer: list[dict] = []
         for taken, item in enumerate(it, 1):
             if len(buffer) < size:
                 buffer.append(item)
-                if len(buffer) < start or taken % 2:
+                if len(buffer) < start or (start < size and taken % 2):
                     continue
                 j = rng.randrange(len(buffer))
                 buffer[j], buffer[-1] = buffer[-1], buffer[j]

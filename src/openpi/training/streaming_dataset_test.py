@@ -720,7 +720,7 @@ def test_the_shuffle_buffer_yields_before_it_is_full_and_grows_to_its_size():
             taken.append(i)
             yield i
 
-    buffer = types.SimpleNamespace(shuffle=True, shuffle_buffer_size=160)
+    buffer = types.SimpleNamespace(shuffle=True, shuffle_buffer_size=160, start_sample=None)
     out = StreamingLeRobotDataset._shuffle_buffer(buffer, stream(), random.Random(0))  # noqa: SLF001
     yielded = [next(out)]
     assert len(taken) == 10  # 160 // 16
@@ -908,3 +908,25 @@ def test_a_position_is_the_pass_episode_and_share_of_it_drawn():
     assert position(samples, order, 12) == (1, 0, 0.0)
     assert position(samples, order, 12 + 7) == (1, 1, 0.25)
     assert position({0: 0.0}, order, 9) == (0, 0, 0.0)
+
+
+def test_a_training_stream_s_buffer_is_full_before_it_yields():
+    """Begun afresh or resumed, a training stream's first item comes once the buffer holds its size, then
+    one goes out for each that comes in; every item comes out once."""
+    taken = []
+
+    def stream():
+        for i in range(1000):
+            taken.append(i)
+            yield i
+
+    for start_sample in (0, 5120):
+        taken.clear()
+        buffer = types.SimpleNamespace(shuffle=True, shuffle_buffer_size=160, start_sample=start_sample)
+        out = StreamingLeRobotDataset._shuffle_buffer(buffer, stream(), random.Random(0))  # noqa: SLF001
+        yielded = [next(out)]
+        assert len(taken) == 160
+        yielded += [next(out) for _ in range(100)]
+        assert len(taken) == 260
+        yielded += list(out)
+        assert sorted(yielded) == list(range(1000))
