@@ -358,18 +358,11 @@ def main(config: _config.TrainConfig):
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
-
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
-
+        # A step's validation before its log and its checkpoint: a run preempted between them resumes
+        # from the checkpoint before and does the step again, validation and all (saved first, a step
+        # cut short there was never validated: 2026-10-28, abc_yam_v3's 10,000). A resumed run's logs to
+        # steps W&B already has are dropped, so the validation goes with the step's training log.
+        scores = {}
         if config.val_interval and (
             (step % config.val_interval == 0 and step > start_step) or step == config.num_train_steps - 1
         ):
@@ -379,7 +372,17 @@ def main(config: _config.TrainConfig):
                 logging.exception("Step %d: the validation failed", step)
             else:
                 pbar.write(f"Step {step}: " + ", ".join(f"{k}={v:.4f}" for k, v in scores.items()))
-                wandb.log(scores, step=step)
+        if step % config.log_interval == 0 or scores:
+            stacked_infos = common_utils.stack_forest(infos)
+            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            pbar.write(f"Step {step}: {info_str}")
+            wandb.log({**reduced_info, **scores}, step=step)
+            infos = []
+        batch = next(data_iter)
+
+        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

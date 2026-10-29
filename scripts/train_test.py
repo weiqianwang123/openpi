@@ -45,3 +45,47 @@ def test_validation_is_also_scored_by_owner():
     assert sets["/sim_val"] == (["sim_val/a", "sim_val/b"], {"sim_val/a": 0.1, "sim_val/b": 0.4}, 16)
     single = dataclasses.replace(config, val_repo_ids=["sim_val/a"], val_sampling_weights={})
     assert list(train.validation_sets(single)) == [""]
+
+
+def test_a_validation_step_is_validated_and_logged_with_its_training_before_its_checkpoint(
+    tmp_path: pathlib.Path, monkeypatch
+):
+    """At a validation step the scores go to W&B with the step's training log, and only then is the
+    step saved: a run preempted before the save does the step again, its validation with it."""
+    events = []
+    monkeypatch.setattr(train, "validate", lambda *args, **kwargs: events.append("validate") or {"val_loss": 0.5})
+    init = train.init_wandb
+
+    def recorded_wandb(*args, **kwargs):  # wandb.init sets wandb.log: record it after
+        init(*args, **kwargs)
+        monkeypatch.setattr(train.wandb, "log", lambda data, step: events.append(("log", step, sorted(data))))
+
+    monkeypatch.setattr(train, "init_wandb", recorded_wandb)
+    save = train._checkpoints.save_state  # noqa: SLF001
+    monkeypatch.setattr(
+        train._checkpoints,  # noqa: SLF001
+        "save_state",
+        lambda manager, state, loader, step: events.append(("save", step)) or save(manager, state, loader, step),
+    )
+    config = dataclasses.replace(
+        _config._CONFIGS_DICT["debug"],  # noqa: SLF001
+        batch_size=2,
+        checkpoint_base_dir=str(tmp_path / "checkpoint"),
+        exp_name="val",
+        num_train_steps=4,
+        log_interval=100,
+        save_interval=2,
+        val_interval=2,
+        val_repo_ids=["fake"],
+    )
+    train.main(config)
+    after_start = [e for e in events if e == "validate" or e[1] > 0]
+    trained = ["grad_norm", "loss", "param_norm"]
+    assert after_start == [
+        "validate",
+        ("log", 2, [*trained, "val_loss"]),
+        ("save", 2),
+        "validate",
+        ("log", 3, [*trained, "val_loss"]),
+        ("save", 3),
+    ]
